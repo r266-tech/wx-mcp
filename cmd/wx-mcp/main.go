@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -197,7 +198,7 @@ func (s *server) handle(req rpcRequest) rpcResponse {
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
 			"protocolVersion": "2024-11-05",
 			"capabilities":   map[string]any{"tools": map[string]any{}},
-			"serverInfo":     map[string]any{"name": "wx-mcp", "version": "1.1.0"},
+			"serverInfo":     map[string]any{"name": "wx-mcp", "version": "1.2.0"},
 		}}
 	case "tools/list":
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": toolDefs}}
@@ -224,6 +225,7 @@ func (s *server) callTool(p toolCallParams) toolResult {
 		"favorites":              s.toolFavorites,
 		"chatroom_announcements": s.toolChatroomAnnouncements,
 		"forward_history":        s.toolForwardHistory,
+		"schema":                 s.toolSchema,
 	}
 	fn, ok := handlers[p.Name]
 	if !ok {
@@ -245,11 +247,16 @@ func errResult(msg string) toolResult {
 
 var toolDefs = []toolDef{
 	{
-		Name:        "sessions",
-		Description: "列出微信聊天会话, 按最新消息时间倒序",
+		Name: "sessions",
+		Description: "聊天会话列表, 按 last_timestamp DESC. " +
+			"字段: display_name / username / type (0私聊/1群) / unread_count / " +
+			"last_timestamp / summary (末条预览) / last_sender_display_name / last_msg_type. " +
+			"type_filter 过滤会话类型. keyword 匹配 username / summary / " +
+			"display_name / nick_name / remark / alias (大小写无关, 空格无关).",
 		InputSchema: jsonSchema(props{
-			"limit":   intProp("返回条数 (默认 50)"),
-			"keyword": strProp("按摘要/用户名模糊搜索"),
+			"limit":       intProp("返回条数 (默认 50)"),
+			"type_filter": strProp("all (默认) / group / friend / official_account / bot"),
+			"keyword":     strProp("模糊搜索"),
 		}, nil),
 	},
 	{
@@ -264,14 +271,14 @@ var toolDefs = []toolDef{
 	},
 	{
 		Name: "messages",
-		Description: "拉取某个会话的消息. talker 是 wxid 或 xxx@chatroom. " +
-			"返回字段含: local_id (会话内顺序 id), server_id (跨表 join key — " +
-			"匹配 transfers/red_packets/favorites.message_server_id), local_type (raw packed int64), " +
-			"base_kind (int32, 低 32 bit: 1文本/3图/34语音/43视频/47表情/49app/10000系统), " +
-			"subtype (int32, 高 32 bit — base_kind=49 时 57=引用回复), " +
-			"kind_name (base_kind 的人读名), message_content (raw 文本/XML), " +
-			"message_content_parsed (可解则含 structured fields, 不可解则缺席, raw 始终保留). " +
-			"群消息 sender_wxid 已解析. after/before 支持 unix秒或 2006-01-02 (本地时区).",
+		Description: "会话消息. talker 是 wxid 或 xxx@chatroom. " +
+			"fields=lite (默认) 返回: local_id / server_id / create_time / create_time_human / " +
+			"sender_wxid / sender_display_name / is_from_me / base_kind / kind_name / content_summary. " +
+			"fields=full 额外返回: local_type (packed int64) / subtype / status / sort_seq / " +
+			"message_content (raw 文本/XML) / message_content_parsed (图/表情/app XML 结构化, " +
+			"引用递归 depth=3) / source. " +
+			"base_kind: 1文本/3图/34语音/43视频/47表情/49app/10000系统. " +
+			"after/before 接 unix秒 或 2006-01-02 (本地时区).",
 		InputSchema: jsonSchema(props{
 			"talker":  strProp("会话对象 (wxid 或 xxx@chatroom)"),
 			"limit":   intProp("返回条数 (默认 50)"),
@@ -279,11 +286,13 @@ var toolDefs = []toolDef{
 			"after":   strProp("起始时间 (unix秒 或 2006-01-02, 本地时区)"),
 			"before":  strProp("截止时间 (unix秒 或 2006-01-02, 本地时区)"),
 			"keyword": strProp("消息内容关键词"),
+			"fields":  strProp("lite (默认) / full"),
 		}, []string{"talker"}),
 	},
 	{
-		Name:        "group_members",
-		Description: "列出群成员 (默认 limit=100, 大群必须分页)",
+		Name: "group_members",
+		Description: "群成员. 字段: username / display_name / nick_name / remark / alias / " +
+			"big_head_url / is_owner / is_friend. stats=true 附 message_count (扫消息表较慢).",
 		InputSchema: jsonSchema(props{
 			"chatroom_id": strProp("群 ID (xxx@chatroom)"),
 			"stats":       boolProp("附带每人发言条数 (扫消息表, 较慢)"),
@@ -305,7 +314,8 @@ var toolDefs = []toolDef{
 	},
 	{
 		Name: "search",
-		Description: "跨会话搜索消息 (4 个 FTS content 分区 UNION ALL + 全局时间倒序). 返回 content/local_id/session_id/talker/create_time. 如果要完整 message_content_parsed, 按 talker + local_id 再调 messages.",
+		Description: "跨会话消息全文搜索 (4 FTS 分区 UNION ALL + 全局时间倒序). " +
+			"字段: content / local_id / session_id / talker / talker_display_name / create_time.",
 		InputSchema: jsonSchema(props{
 			"keyword": strProp("搜索关键词"),
 			"limit":   intProp("返回条数 (默认 20)"),
@@ -313,7 +323,7 @@ var toolDefs = []toolDef{
 	},
 	{
 		Name:        "sql",
-		Description: "在指定 db 上跑任意只读 SQL. subdir/file 指定数据库位置, 如 session/session.db, contact/contact.db, message/message_0.db, sns/sns.db, general/general.db, favorite/favorite.db, hardlink/hardlink.db",
+		Description: "本地 WCDB 只读 SQL. db 位置由 subdir/file 定位. 用 schema tool 列出有哪些 db 和表.",
 		InputSchema: jsonSchema(props{
 			"query":  strProp("SQL 语句"),
 			"subdir": strProp("db_storage 下的子目录 (默认 session)"),
@@ -322,28 +332,30 @@ var toolDefs = []toolDef{
 	},
 	{
 		Name: "transfers",
-		Description: "微信转账记录. message_server_id 可 join 到 messages.server_id 拿对应消息 XML (转账金额藏在那, 不在本表).",
+		Description: "微信转账记录. message_server_id 对应 messages.server_id (join 拿原消息 XML 含金额).",
 		InputSchema: jsonSchema(props{
 			"limit": intProp("返回条数 (默认 50)"),
 		}, nil),
 	},
 	{
 		Name: "red_packets",
-		Description: "微信红包记录. message_server_id 可 join 到 messages.server_id 拿对应消息 XML.",
+		Description: "微信红包记录. message_server_id 对应 messages.server_id.",
 		InputSchema: jsonSchema(props{
 			"limit": intProp("返回条数 (默认 50)"),
 		}, nil),
 	},
 	{
 		Name: "favorites",
-		Description: "微信收藏列表. message_server_id 可 join 到 messages.server_id 拿对应消息 XML.",
+		Description: "微信收藏. message_server_id 对应 messages.server_id.",
 		InputSchema: jsonSchema(props{
 			"limit": intProp("返回条数 (默认 50)"),
 		}, nil),
 	},
 	{
-		Name:        "chatroom_announcements",
-		Description: "群公告 (公告正文可能很长, 默认 limit=20 防 token 爆炸)",
+		Name: "chatroom_announcements",
+		Description: "群公告. 字段: chatroom_id / chatroom_display_name / announcement_ / " +
+			"announcement_editor_ / editor_display_name / announcement_publish_time_ / chat_room_status_. " +
+			"不传 chatroom_id 按 announcement_publish_time_ DESC.",
 		InputSchema: jsonSchema(props{
 			"chatroom_id": strProp("群 ID (xxx@chatroom), 不传则返回所有群公告 (按发布时间倒序)"),
 			"limit":       intProp("返回条数 (默认 20)"),
@@ -351,9 +363,18 @@ var toolDefs = []toolDef{
 	},
 	{
 		Name:        "forward_history",
-		Description: "最近转发记录 (转发给谁, 何时)",
+		Description: "最近转发目标. 字段: username / display_name / forward_time.",
 		InputSchema: jsonSchema(props{
 			"limit": intProp("返回条数 (默认 50)"),
+		}, nil),
+	},
+	{
+		Name: "schema",
+		Description: "WCDB 数据库结构. 不传参数列出所有 subdir 下 db 的表名 (分片的 message_*.db 折叠为一条 + shard_count). " +
+			"传 subdir+file 返回该 db 每张表的 CREATE TABLE DDL.",
+		InputSchema: jsonSchema(props{
+			"subdir": strProp("db_storage 下子目录"),
+			"file":   strProp("数据库文件名"),
 		}, nil),
 	},
 }
@@ -369,10 +390,38 @@ func (s *server) toolSessions(a map[string]any) (any, error) {
 	var where []string
 	var args []any
 	where = append(where, "COALESCE(is_hidden, 0) = 0")
+	if tf := getStr(a, "type_filter"); tf != "" && tf != "all" {
+		switch tf {
+		case "group":
+			where = append(where, "username LIKE '%@chatroom'")
+		case "friend":
+			where = append(where, `username NOT LIKE '%@chatroom'
+				AND username NOT LIKE 'gh!_%' ESCAPE '!'
+				AND username NOT LIKE '%@openim'
+				AND username NOT LIKE '%@weclaw'
+				AND username NOT LIKE '%@stranger'`)
+		case "official_account":
+			where = append(where, "username LIKE 'gh!_%' ESCAPE '!'")
+		case "bot":
+			where = append(where, "username LIKE '%@weclaw'")
+		}
+	}
 	if kw := getStr(a, "keyword"); kw != "" {
-		where = append(where, "(username LIKE ? OR summary LIKE ?)")
+		// Cross-db: also include sessions whose talker matches display_name /
+		// nick_name / remark / alias in contact.db (fuzzy, case+space insensitive).
+		matched := s.findUsernamesByFuzzyName(kw)
+		clauses := []string{"username LIKE ? COLLATE NOCASE", "summary LIKE ? COLLATE NOCASE"}
 		like := "%" + kw + "%"
 		args = append(args, like, like)
+		if len(matched) > 0 {
+			ph := make([]string, len(matched))
+			for i, u := range matched {
+				ph[i] = "?"
+				args = append(args, u)
+			}
+			clauses = append(clauses, fmt.Sprintf("username IN (%s)", strings.Join(ph, ",")))
+		}
+		where = append(where, "("+strings.Join(clauses, " OR ")+")")
 	}
 	args = append(args, getInt(a, "limit", 50))
 	rows, err := db.Query(fmt.Sprintf(`SELECT username, type, unread_count, summary,
@@ -404,9 +453,19 @@ func (s *server) toolContacts(a map[string]any) (any, error) {
 		where = append(where, "username NOT LIKE '%@chatroom' AND username NOT LIKE 'gh_%' AND username NOT LIKE '%@openim'")
 	}
 	if kw := getStr(a, "keyword"); kw != "" {
-		where = append(where, "(username LIKE ? OR nick_name LIKE ? OR remark LIKE ? OR alias LIKE ? OR pin_yin_initial LIKE ?)")
+		// Fuzzy match: case-insensitive (COLLATE NOCASE) + whitespace-tolerant
+		// via REPLACE(field, ' ', '') — so "aiagent" / "AI agent" / "Ai Agent"
+		// all match a contact named "AI Agent".
+		where = append(where, `(username LIKE ? COLLATE NOCASE
+			OR nick_name LIKE ? COLLATE NOCASE
+			OR REPLACE(nick_name, ' ', '') LIKE ? COLLATE NOCASE
+			OR remark LIKE ? COLLATE NOCASE
+			OR REPLACE(remark, ' ', '') LIKE ? COLLATE NOCASE
+			OR alias LIKE ? COLLATE NOCASE
+			OR pin_yin_initial LIKE ? COLLATE NOCASE)`)
 		like := "%" + kw + "%"
-		args = append(args, like, like, like, like, like)
+		likeNoSpace := "%" + strings.ReplaceAll(kw, " ", "") + "%"
+		args = append(args, like, like, likeNoSpace, like, likeNoSpace, like, like)
 	}
 	wc := ""
 	if len(where) > 0 {
@@ -486,7 +545,41 @@ func (s *server) toolMessages(a map[string]any) (any, error) {
 	}
 	rows = enrichMessages(decodeFields(rows, "message_content", "source"))
 	s.attachDisplayNames(rows, [2]string{"sender_wxid", "sender_display_name"})
-	return rows, nil
+	if selfWxid := s.selfWxid(); selfWxid != "" {
+		for _, r := range rows {
+			sw, _ := r["sender_wxid"].(string)
+			r["is_from_me"] = (sw == selfWxid)
+		}
+	}
+	mode := getStr(a, "fields")
+	if mode == "" {
+		mode = "lite"
+	}
+	return liteMessages(rows, mode), nil
+}
+
+// liteMessages strips raw XML / parsed / source / housekeeping fields when
+// mode=lite. Keeps the 8 fields that matter for human-readable summarization
+// (typical 100-row response: ~250KB full → ~12KB lite, ~95% reduction).
+// mode=full passes through unchanged.
+func liteMessages(rows []wcdb.Row, mode string) []wcdb.Row {
+	if mode != "lite" {
+		return rows
+	}
+	keep := map[string]bool{
+		"local_id": true, "server_id": true,
+		"create_time": true, "create_time_human": true,
+		"sender_wxid": true, "sender_display_name": true, "is_from_me": true,
+		"base_kind": true, "kind_name": true, "content_summary": true,
+	}
+	for _, r := range rows {
+		for k := range r {
+			if !keep[k] {
+				delete(r, k)
+			}
+		}
+	}
+	return rows
 }
 
 func (s *server) toolGroupMembers(a map[string]any) (any, error) {
@@ -788,6 +881,82 @@ func (s *server) toolChatroomAnnouncements(a map[string]any) (any, error) {
 		[2]string{"chatroom_id", "chatroom_display_name"},
 		[2]string{"announcement_editor_", "editor_display_name"})
 	return rows, nil
+}
+
+func (s *server) toolSchema(a map[string]any) (any, error) {
+	subdir := getStr(a, "subdir")
+	file := getStr(a, "file")
+	if subdir != "" && file != "" {
+		db, err := s.openDB(subdir, file)
+		if err != nil {
+			return nil, err
+		}
+		defer db.Close()
+		return db.Query(`SELECT name, sql FROM sqlite_master
+			WHERE type='table' AND name NOT LIKE 'sqlite_%'
+			ORDER BY name`)
+	}
+	dbRoot := filepath.Join(s.cfg.DBRoot, "db_storage")
+	entries, err := os.ReadDir(dbRoot)
+	if err != nil {
+		return nil, err
+	}
+	shardRE := regexp.MustCompile(`_\d+\.db$`)
+	type out struct {
+		Subdir     string   `json:"subdir"`
+		File       string   `json:"file"`
+		ShardCount int      `json:"shard_count,omitempty"`
+		Tables     []string `json:"tables"`
+	}
+	var result []out
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		sub := e.Name()
+		files, err := os.ReadDir(filepath.Join(dbRoot, sub))
+		if err != nil {
+			continue
+		}
+		var canonical string
+		shardCount := 0
+		for _, f := range files {
+			name := f.Name()
+			if !strings.HasSuffix(name, ".db") {
+				continue
+			}
+			if shardRE.MatchString(name) {
+				shardCount++
+				if canonical == "" {
+					canonical = name
+				}
+			} else if canonical == "" || shardRE.MatchString(canonical) {
+				canonical = name
+			}
+		}
+		if canonical == "" {
+			continue
+		}
+		db, err := s.openDB(sub, canonical)
+		if err != nil {
+			continue
+		}
+		rows, err := db.Query(`SELECT name FROM sqlite_master
+			WHERE type='table' AND name NOT LIKE 'sqlite_%'
+			ORDER BY name`)
+		db.Close()
+		if err != nil {
+			continue
+		}
+		tables := make([]string, 0, len(rows))
+		for _, r := range rows {
+			if n, ok := r["name"].(string); ok {
+				tables = append(tables, n)
+			}
+		}
+		result = append(result, out{Subdir: sub, File: canonical, ShardCount: shardCount, Tables: tables})
+	}
+	return result, nil
 }
 
 func (s *server) toolForwardHistory(a map[string]any) (any, error) {
@@ -1285,6 +1454,9 @@ func enrichMessages(rows []wcdb.Row) []wcdb.Row {
 			}
 		}
 		row["content_summary"] = contentSummary(baseKind, subtype, content, row["message_content_parsed"])
+		if ct, ok := row["create_time"].(int64); ok && ct > 0 {
+			row["create_time_human"] = time.Unix(ct, 0).Format("2006-01-02 15:04:05")
+		}
 	}
 	return rows
 }
@@ -1354,6 +1526,52 @@ func classifyUsername(u string) string {
 		return "friend"
 	}
 	return "other"
+}
+
+// selfWxid derives V's own wxid by stripping WeChat 4.x's _<4-hex> device
+// suffix from the config wxid. Returns empty if config wxid is unset.
+func (s *server) selfWxid() string {
+	raw := s.cfg.Wxid
+	if raw == "" {
+		return ""
+	}
+	if i := strings.LastIndex(raw, "_"); i > 0 && len(raw)-i == 5 {
+		return raw[:i]
+	}
+	return raw
+}
+
+// findUsernamesByFuzzyName returns contact usernames whose display identity
+// (nick_name / remark / alias) matches keyword case-insensitively and
+// space-insensitively. Used by sessions.keyword to enable cross-db display_name
+// search without regressing the user-visible interface.
+func (s *server) findUsernamesByFuzzyName(kw string) []string {
+	if kw == "" {
+		return nil
+	}
+	db, err := s.openDB("contact", "contact.db")
+	if err != nil {
+		return nil
+	}
+	defer db.Close()
+	like := "%" + kw + "%"
+	likeNoSpace := "%" + strings.ReplaceAll(kw, " ", "") + "%"
+	rows, err := db.Query(`SELECT username FROM contact WHERE
+		nick_name LIKE ? COLLATE NOCASE
+		OR REPLACE(nick_name, ' ', '') LIKE ? COLLATE NOCASE
+		OR remark LIKE ? COLLATE NOCASE
+		OR REPLACE(remark, ' ', '') LIKE ? COLLATE NOCASE
+		OR alias LIKE ? COLLATE NOCASE`, like, likeNoSpace, like, likeNoSpace, like)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if u, ok := r["username"].(string); ok {
+			out = append(out, u)
+		}
+	}
+	return out
 }
 
 // lookupDisplayNames batch-queries contact.db for remark > nick_name > username
