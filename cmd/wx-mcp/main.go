@@ -333,40 +333,53 @@ var toolDefs = []toolDef{
 	},
 	{
 		Name: "transfers",
-		Description: "微信转账记录. message_server_id 对应 messages.server_id (join 拿原消息 XML 含金额).",
+		Description: "微信转账记录. message_server_id 对应 messages.server_id (join 拿原消息 XML 含金额). " +
+			"after/before 按 begin_transfer_time 过滤, 接 unix秒 或 2006-01-02 (本地时区).",
 		InputSchema: jsonSchema(props{
-			"limit": intProp("返回条数 (默认 50)"),
+			"limit":  intProp("返回条数 (默认 50)"),
+			"after":  strProp("起始时间 (unix秒 或 2006-01-02, 本地时区)"),
+			"before": strProp("截止时间 (unix秒 或 2006-01-02, 本地时区)"),
 		}, nil),
 	},
 	{
 		Name: "red_packets",
-		Description: "微信红包记录. message_server_id 对应 messages.server_id.",
+		Description: "微信红包记录. message_server_id 对应 messages.server_id. " +
+			"表无时间字段, 按 rowid DESC (近似收到顺序). 要按真实发生时间过滤请用 sql tool JOIN messages via message_server_id.",
 		InputSchema: jsonSchema(props{
 			"limit": intProp("返回条数 (默认 50)"),
 		}, nil),
 	},
 	{
 		Name: "favorites",
-		Description: "微信收藏. message_server_id 对应 messages.server_id.",
+		Description: "微信收藏. message_server_id 对应 messages.server_id. " +
+			"after/before 按 update_time 过滤, 接 unix秒 或 2006-01-02 (本地时区).",
 		InputSchema: jsonSchema(props{
-			"limit": intProp("返回条数 (默认 50)"),
+			"limit":  intProp("返回条数 (默认 50)"),
+			"after":  strProp("起始时间 (unix秒 或 2006-01-02, 本地时区)"),
+			"before": strProp("截止时间 (unix秒 或 2006-01-02, 本地时区)"),
 		}, nil),
 	},
 	{
 		Name: "chatroom_announcements",
 		Description: "群公告. 字段: chatroom_id / chatroom_display_name / announcement_ / " +
 			"announcement_editor_ / editor_display_name / announcement_publish_time_ / chat_room_status_. " +
-			"不传 chatroom_id 按 announcement_publish_time_ DESC.",
+			"不传 chatroom_id 按 announcement_publish_time_ DESC. " +
+			"after/before 按 announcement_publish_time_ 过滤, 接 unix秒 或 2006-01-02 (本地时区).",
 		InputSchema: jsonSchema(props{
 			"chatroom_id": strProp("群 ID (xxx@chatroom), 不传则返回所有群公告 (按发布时间倒序)"),
 			"limit":       intProp("返回条数 (默认 20)"),
+			"after":       strProp("起始时间 (unix秒 或 2006-01-02, 本地时区)"),
+			"before":      strProp("截止时间 (unix秒 或 2006-01-02, 本地时区)"),
 		}, nil),
 	},
 	{
-		Name:        "forward_history",
-		Description: "最近转发目标. 字段: username / display_name / forward_time.",
+		Name: "forward_history",
+		Description: "最近转发目标. 字段: username / display_name / forward_time. " +
+			"after/before 按 forward_time 过滤, 接 unix秒 或 2006-01-02 (本地时区).",
 		InputSchema: jsonSchema(props{
-			"limit": intProp("返回条数 (默认 50)"),
+			"limit":  intProp("返回条数 (默认 50)"),
+			"after":  strProp("起始时间 (unix秒 或 2006-01-02, 本地时区)"),
+			"before": strProp("截止时间 (unix秒 或 2006-01-02, 本地时区)"),
 		}, nil),
 	},
 	{
@@ -798,13 +811,36 @@ func (s *server) toolTransfers(a map[string]any) (any, error) {
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.Query(`SELECT transfer_id, transcation_id, session_name,
+	var where []string
+	var args []any
+	if t := getStr(a, "after"); t != "" {
+		ts, err := parseTS(t)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "begin_transfer_time >= ?")
+		args = append(args, ts)
+	}
+	if t := getStr(a, "before"); t != "" {
+		ts, err := parseTS(t)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "begin_transfer_time < ?")
+		args = append(args, ts)
+	}
+	wc := ""
+	if len(where) > 0 {
+		wc = "WHERE " + strings.Join(where, " AND ")
+	}
+	args = append(args, getInt(a, "limit", 50))
+	rows, err := db.Query(fmt.Sprintf(`SELECT transfer_id, transcation_id, session_name,
 		pay_payer, pay_receiver, pay_sub_type,
 		begin_transfer_time, invalid_time, last_modified_time,
 		message_server_id
-		FROM transferTable
+		FROM transferTable %s
 		ORDER BY begin_transfer_time DESC
-		LIMIT ?`, getInt(a, "limit", 50))
+		LIMIT ?`, wc), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -842,11 +878,34 @@ func (s *server) toolFavorites(a map[string]any) (any, error) {
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.Query(`SELECT local_id, server_id, type, update_seq, flag,
+	var where []string
+	var args []any
+	if t := getStr(a, "after"); t != "" {
+		ts, err := parseTS(t)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "update_time >= ?")
+		args = append(args, ts)
+	}
+	if t := getStr(a, "before"); t != "" {
+		ts, err := parseTS(t)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "update_time < ?")
+		args = append(args, ts)
+	}
+	wc := ""
+	if len(where) > 0 {
+		wc = "WHERE " + strings.Join(where, " AND ")
+	}
+	args = append(args, getInt(a, "limit", 50))
+	rows, err := db.Query(fmt.Sprintf(`SELECT local_id, server_id, type, update_seq, flag,
 		update_time, source_id, fromusr
-		FROM fav_db_item
+		FROM fav_db_item %s
 		ORDER BY update_seq DESC
-		LIMIT ?`, getInt(a, "limit", 50))
+		LIMIT ?`, wc), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -861,20 +920,37 @@ func (s *server) toolChatroomAnnouncements(a map[string]any) (any, error) {
 	}
 	defer db.Close()
 	limit := getInt(a, "limit", 20)
-	var rows []wcdb.Row
+	var where []string
+	var args []any
 	if cid := getStr(a, "chatroom_id"); cid != "" {
-		rows, err = db.Query(`SELECT username_ AS chatroom_id, announcement_, announcement_editor_,
-			announcement_publish_time_, chat_room_status_
-			FROM chat_room_info_detail WHERE username_ = ?
-			LIMIT ?`, cid, limit)
+		where = append(where, "username_ = ?")
+		args = append(args, cid)
 	} else {
-		rows, err = db.Query(`SELECT username_ AS chatroom_id, announcement_, announcement_editor_,
-			announcement_publish_time_, chat_room_status_
-			FROM chat_room_info_detail
-			WHERE announcement_ IS NOT NULL AND announcement_ != ''
-			ORDER BY announcement_publish_time_ DESC
-			LIMIT ?`, limit)
+		where = append(where, "announcement_ IS NOT NULL AND announcement_ != ''")
 	}
+	if t := getStr(a, "after"); t != "" {
+		ts, err := parseTS(t)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "announcement_publish_time_ >= ?")
+		args = append(args, ts)
+	}
+	if t := getStr(a, "before"); t != "" {
+		ts, err := parseTS(t)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "announcement_publish_time_ < ?")
+		args = append(args, ts)
+	}
+	args = append(args, limit)
+	rows, err := db.Query(fmt.Sprintf(`SELECT username_ AS chatroom_id, announcement_, announcement_editor_,
+		announcement_publish_time_, chat_room_status_
+		FROM chat_room_info_detail
+		WHERE %s
+		ORDER BY announcement_publish_time_ DESC
+		LIMIT ?`, strings.Join(where, " AND ")), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -966,10 +1042,33 @@ func (s *server) toolForwardHistory(a map[string]any) (any, error) {
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.Query(`SELECT username, forward_time
-		FROM ForwardRecent
+	var where []string
+	var args []any
+	if t := getStr(a, "after"); t != "" {
+		ts, err := parseTS(t)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "forward_time >= ?")
+		args = append(args, ts)
+	}
+	if t := getStr(a, "before"); t != "" {
+		ts, err := parseTS(t)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "forward_time < ?")
+		args = append(args, ts)
+	}
+	wc := ""
+	if len(where) > 0 {
+		wc = "WHERE " + strings.Join(where, " AND ")
+	}
+	args = append(args, getInt(a, "limit", 50))
+	rows, err := db.Query(fmt.Sprintf(`SELECT username, forward_time
+		FROM ForwardRecent %s
 		ORDER BY forward_time DESC
-		LIMIT ?`, getInt(a, "limit", 50))
+		LIMIT ?`, wc), args...)
 	if err != nil {
 		return nil, err
 	}
