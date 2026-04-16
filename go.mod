@@ -1,4 +1,4 @@
-module github.com/r266-tech/wxcli
+module github.com/r266-tech/wx-mcp
 
 go 1.26.2
 

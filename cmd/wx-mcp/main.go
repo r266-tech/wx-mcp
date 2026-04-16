@@ -17,9 +17,11 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 
-	"github.com/r266-tech/wxcli/internal/config"
-	"github.com/r266-tech/wxcli/internal/wcdb"
-	"github.com/r266-tech/wxcli/internal/weflow"
+	"github.com/r266-tech/wx-mcp/internal/config"
+	"github.com/r266-tech/wx-mcp/internal/wcdb"
+	"github.com/r266-tech/wx-mcp/internal/weflow"
+	"github.com/r266-tech/wx-mcp/internal/wxkind"
+	"github.com/r266-tech/wx-mcp/internal/wxparse"
 )
 
 // ──────────────────── MCP protocol types ────────────────────
@@ -198,7 +200,7 @@ func (s *server) handle(req rpcRequest) rpcResponse {
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
 			"protocolVersion": "2024-11-05",
 			"capabilities":   map[string]any{"tools": map[string]any{}},
-			"serverInfo":     map[string]any{"name": "wx-mcp", "version": "1.2.0"},
+			"serverInfo":     map[string]any{"name": "wx-mcp", "version": "1.3.0"},
 		}}
 	case "tools/list":
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": toolDefs}}
@@ -485,7 +487,7 @@ func (s *server) toolSessions(a map[string]any) (any, error) {
 	for _, r := range rows {
 		bk, _ := r["last_msg_type"].(int64)
 		st, _ := r["last_msg_sub_type"].(int64)
-		r["last_msg_kind_name"] = kindName(int32(bk), int32(st))
+		r["last_msg_kind_name"] = wxkind.Resolve(int32(bk), int32(st))
 		for _, k := range []string{"last_sender_wxid", "last_sender_display_name"} {
 			if v, ok := r[k].(string); ok && v == "" {
 				delete(r, k)
@@ -539,7 +541,7 @@ func (s *server) toolContacts(a map[string]any) (any, error) {
 	}
 	for _, r := range rows {
 		u, _ := r["username"].(string)
-		r["type"] = classifyUsername(u)
+		r["type"] = wxkind.ClassifyUsername(u)
 		vf, _ := r["verify_flag"].(int64)
 		r["is_verified"] = vf != 0
 		delete(r, "verify_flag")
@@ -583,18 +585,24 @@ func (s *server) toolMessages(a map[string]any) (any, error) {
 		where = append(where, "create_time < ?")
 		args = append(args, ts)
 	}
-	if kw := getStr(a, "keyword"); kw != "" {
-		where = append(where, "message_content LIKE ?")
-		args = append(args, "%"+kw+"%")
-	}
-
 	wc := ""
 	if len(where) > 0 {
 		wc = "WHERE " + strings.Join(where, " AND ")
 	}
 	limit := getInt(a, "limit", 50)
 	offset := getInt(a, "offset", 0)
-	args = append(args, limit, offset)
+	kw := getStr(a, "keyword")
+
+	// keyword 不能进 SQL WHERE — message_content 是 zstd 压缩 BLOB, LIKE
+	// 在压缩字节上 match 不了任何文本. 改在 enrich 解压后 in-memory filter.
+	// 拉宽 SQL 取数, offset 也在 Go 里应用 (避免 SQL offset 跳过未命中行).
+	sqlLimit := limit
+	sqlOffset := offset
+	if kw != "" {
+		sqlLimit = 5000
+		sqlOffset = 0
+	}
+	args = append(args, sqlLimit, sqlOffset)
 
 	rows, err := db.Query(fmt.Sprintf(`SELECT local_id, server_id, local_type, sort_seq,
 		real_sender_id, create_time, status, message_content, source
@@ -621,6 +629,25 @@ func (s *server) toolMessages(a map[string]any) (any, error) {
 		delete(r, "status")
 		delete(r, "source")
 		delete(r, "local_type")
+	}
+	if kw != "" {
+		filtered := rows[:0]
+		for _, r := range rows {
+			content, _ := r["message_content"].(string)
+			summary, _ := r["content_summary"].(string)
+			if strings.Contains(content, kw) || strings.Contains(summary, kw) {
+				filtered = append(filtered, r)
+			}
+		}
+		if offset < len(filtered) {
+			filtered = filtered[offset:]
+		} else {
+			filtered = nil
+		}
+		if len(filtered) > limit {
+			filtered = filtered[:limit]
+		}
+		rows = filtered
 	}
 	mode := getStr(a, "fields")
 	if mode == "" {
@@ -915,7 +942,7 @@ func (s *server) enrichSearchSender(rows []wcdb.Row) {
 			lid, _ := mr["local_id"].(int64)
 			rsid, _ := mr["real_sender_id"].(int64)
 			lt, _ := mr["local_type"].(int64)
-			bk, _, name := unpackLocalType(lt)
+			bk, _, name := wxkind.Unpack(lt)
 			m := meta{baseKind: bk, kindName: name}
 			if w, ok := n2i[rsid]; ok {
 				m.senderWxid = w
@@ -1004,7 +1031,7 @@ func (s *server) toolTransfers(a map[string]any) (any, error) {
 		if !ok {
 			continue
 		}
-		amount, des, memo := extractTransferInfo(c)
+		amount, des, memo := wxparse.TransferInfo(c)
 		if amount != "" {
 			r["amount"] = amount
 		}
@@ -1045,7 +1072,7 @@ func (s *server) toolRedPackets(a map[string]any) (any, error) {
 		if !ok {
 			continue
 		}
-		wishing, sceneText := extractRedPacketInfo(c)
+		wishing, sceneText := wxparse.RedPacketInfo(c)
 		if wishing != "" {
 			r["wishing"] = wishing
 		}
@@ -1100,9 +1127,9 @@ func (s *server) toolFavorites(a map[string]any) (any, error) {
 	}
 	for _, r := range rows {
 		ti, _ := r["type_id"].(int64)
-		r["favorite_type"] = favKindName(ti)
+		r["favorite_type"] = wxkind.FavKind(ti)
 		if c, ok := r["content"].(string); ok && c != "" {
-			if title, desc, url := extractFavoriteInfo(c); title != "" || desc != "" || url != "" {
+			if title, desc, url := wxparse.FavoriteInfo(c); title != "" || desc != "" || url != "" {
 				if title != "" {
 					r["title"] = title
 				}
@@ -1597,65 +1624,6 @@ func loadSnsInteractions(db *wcdb.DB, tids []int64) (map[int64][]snsReact, map[i
 
 // ──────────────────── message_content enrichment ────────────────────
 
-// local_type is a packed int64: (subtype << 32) | base_kind.
-// base_kind covers wechat's top-level message kind; for base_kind=49 the
-// subtype refines the app-message kind (link/file/quote/transfer/...).
-// Mappings sourced from WeFlow (electron/services/{chatService,exportService}).
-var baseKindNames = map[int32]string{
-	1:     "text",
-	3:     "image",
-	34:    "voice",
-	42:    "card",
-	43:    "video",
-	47:    "sticker",
-	48:    "location",
-	49:    "app",
-	50:    "voip",
-	10000: "system",
-}
-
-// appSubtypeNames maps app-message subtype (when base_kind=49) to a precise
-// human-readable kind. Falls back to "app" when subtype is unknown.
-var appSubtypeNames = map[int32]string{
-	3:    "music",
-	5:    "link",
-	6:    "file",
-	8:    "file",
-	19:   "forward_chat",
-	24:   "file",
-	33:   "miniprogram",
-	36:   "miniprogram",
-	49:   "link",
-	51:   "channel_video",
-	57:   "quote",
-	62:   "pat",
-	87:   "announcement",
-	2000: "transfer",
-	2001: "red_packet",
-}
-
-// kindName resolves (base_kind, subtype) to the most specific human-readable
-// label. For base_kind=49 it consults appSubtypeNames first; otherwise uses
-// baseKindNames. Returns "unknown" if neither matches.
-func kindName(baseKind, subtype int32) string {
-	if baseKind == 49 {
-		if n, ok := appSubtypeNames[subtype]; ok {
-			return n
-		}
-	}
-	if n, ok := baseKindNames[baseKind]; ok {
-		return n
-	}
-	return "unknown"
-}
-
-func unpackLocalType(lt int64) (baseKind, subtype int32, name string) {
-	baseKind = int32(lt & 0xFFFFFFFF)
-	subtype = int32(lt >> 32)
-	name = kindName(baseKind, subtype)
-	return
-}
-
 type xmlMsgImg struct {
 	XMLName xml.Name `xml:"msg"`
 	Img     struct {
@@ -1705,111 +1673,6 @@ type xmlMsgReferMsg struct {
 	SvrID       string `xml:"svrid"`
 	FromUsr     string `xml:"fromusr"`
 	Content     string `xml:"content"`
-}
-
-// xmlTransferMsg parses wechat transfer (subtype=2000) messages. Amount is in
-// wcpayinfo.feedesc ("￥5.00"); appmsg.des is human-readable summary
-// ("收到转账5.00元"); pay_memo is sender's note attached to the transfer.
-type xmlTransferMsg struct {
-	XMLName xml.Name `xml:"msg"`
-	AppMsg  struct {
-		Des       string `xml:"des"`
-		WcPayInfo struct {
-			FeeDesc    string `xml:"feedesc"`
-			PaySubType int    `xml:"paysubtype"`
-			PayMemo    string `xml:"pay_memo"`
-		} `xml:"wcpayinfo"`
-	} `xml:"appmsg"`
-}
-
-func extractTransferInfo(content string) (amount, des, memo string) {
-	var t xmlTransferMsg
-	if err := xml.Unmarshal([]byte(stripMsgPrefix(content)), &t); err != nil {
-		return
-	}
-	return t.AppMsg.WcPayInfo.FeeDesc, t.AppMsg.Des, t.AppMsg.WcPayInfo.PayMemo
-}
-
-// favTypeNames maps wechat favorite kind ints to a human-readable label.
-// Source: WeChat client schema (CDataItem types). 20 occasionally seen but
-// undocumented — falls back to "unknown".
-var favTypeNames = map[int64]string{
-	1:  "text",
-	2:  "image",
-	3:  "voice",
-	4:  "video",
-	5:  "link",
-	6:  "location",
-	8:  "file",
-	14: "chat_history",
-	18: "miniprogram",
-}
-
-func favKindName(t int64) string {
-	if n, ok := favTypeNames[t]; ok {
-		return n
-	}
-	return "unknown"
-}
-
-// xmlFavItem covers the most common favorite XML shapes (link / note / data).
-// title/desc/url fields fall through whichever sub-item element is populated.
-type xmlFavItem struct {
-	XMLName    xml.Name `xml:"favitem"`
-	WebURLItem struct {
-		PageTitle string `xml:"pagetitle"`
-		PageDesc  string `xml:"pagedesc"`
-		CleanURL  string `xml:"clean_url"`
-	} `xml:"weburlitem"`
-	NoteItem struct {
-		Title       string `xml:"title"`
-		Description string `xml:"description"`
-	} `xml:"noteitem"`
-	DataItem struct {
-		DataTitle string `xml:"datatitle"`
-		DataDesc  string `xml:"datadesc"`
-	} `xml:"dataitem"`
-}
-
-func extractFavoriteInfo(content string) (title, desc, url string) {
-	var f xmlFavItem
-	if err := xml.Unmarshal([]byte(content), &f); err != nil {
-		return
-	}
-	switch {
-	case f.WebURLItem.PageTitle != "":
-		return f.WebURLItem.PageTitle, f.WebURLItem.PageDesc, f.WebURLItem.CleanURL
-	case f.NoteItem.Title != "":
-		return f.NoteItem.Title, f.NoteItem.Description, ""
-	case f.DataItem.DataTitle != "":
-		return f.DataItem.DataTitle, f.DataItem.DataDesc, ""
-	}
-	return
-}
-
-// xmlRedPacketMsg parses wechat red-packet (subtype=2001) messages.
-// sendertitle is sender-side wishing text; nativeurl carries the deep link;
-// scenetext distinguishes 1v1 / group / luck-draw scenarios.
-type xmlRedPacketMsg struct {
-	XMLName xml.Name `xml:"msg"`
-	AppMsg  struct {
-		WcPayInfo struct {
-			SenderTitle    string `xml:"sendertitle"`
-			ReceiverTitle  string `xml:"receivertitle"`
-			SceneText      string `xml:"scenetext"`
-			TemplateID     string `xml:"templateid"`
-			InnerType      int    `xml:"innertype"`
-			NativeURL      string `xml:"nativeurl"`
-		} `xml:"wcpayinfo"`
-	} `xml:"appmsg"`
-}
-
-func extractRedPacketInfo(content string) (wishing, sceneText string) {
-	var r xmlRedPacketMsg
-	if err := xml.Unmarshal([]byte(stripMsgPrefix(content)), &r); err != nil {
-		return
-	}
-	return r.AppMsg.WcPayInfo.SenderTitle, r.AppMsg.WcPayInfo.SceneText
 }
 
 // fetchMessageContent batch-loads message_content (zstd decoded) for a list of
@@ -1950,7 +1813,7 @@ func enrichMessages(rows []wcdb.Row) []wcdb.Row {
 		if !ok {
 			continue
 		}
-		baseKind, subtype, name := unpackLocalType(lt)
+		baseKind, subtype, name := wxkind.Unpack(lt)
 		row["base_kind"] = baseKind
 		row["subtype"] = subtype
 		row["kind_name"] = name
@@ -2019,27 +1882,6 @@ func contentSummary(baseKind, subtype int32, raw string, parsed any) string {
 		return raw
 	}
 	return fmt.Sprintf("[未知类型 base_kind=%d]", baseKind)
-}
-
-// classifyUsername maps a raw username to a human-readable type by well-known
-// patterns (suffix/prefix). Stable across schema changes since it depends only
-// on the username string shape, not local_type which varies by WeChat version.
-func classifyUsername(u string) string {
-	switch {
-	case strings.HasSuffix(u, "@chatroom"):
-		return "group"
-	case strings.HasPrefix(u, "gh_"):
-		return "official_account"
-	case strings.HasSuffix(u, "@openim"):
-		return "corp_im"
-	case strings.HasSuffix(u, "@weclaw"):
-		return "clawbot"
-	case strings.HasSuffix(u, "@stranger"):
-		return "stranger"
-	case strings.HasPrefix(u, "wxid_"):
-		return "friend"
-	}
-	return "other"
 }
 
 // selfWxid derives V's own wxid by stripping WeChat 4.x's _<4-hex> device
