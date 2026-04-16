@@ -248,9 +248,13 @@ func errResult(msg string) toolResult {
 var toolDefs = []toolDef{
 	{
 		Name: "sessions",
-		Description: "聊天会话列表, 按 last_timestamp DESC. " +
-			"字段: display_name / username / type (0私聊/1群) / unread_count / " +
-			"last_timestamp / summary (末条预览) / last_sender_display_name / last_msg_type. " +
+		Description: "聊天会话列表, 按 sort_timestamp DESC. " +
+			"字段: username / display_name / unread_count / summary (末条预览) / " +
+			"sort_timestamp (含置顶调整, 用于排序) / last_timestamp (最新消息实际时间, 多数情况两者相等) / " +
+			"last_sender_wxid / last_sender_display_name / " +
+			"last_msg_type (base_kind raw int) / last_msg_sub_type (subtype raw int) / " +
+			"last_msg_kind_name (resolved: text/image/voice/card/video/sticker/location/voip/system, " +
+			"app 子类 link/file/music/quote/transfer/red_packet/miniprogram/forward_chat/announcement/pat/channel_video). " +
 			"type_filter 识别: group=@chatroom 后缀, official_account=gh_ 前缀, " +
 			"bot=@weclaw 后缀, friend=其他. keyword 匹配 username / summary / " +
 			"display_name / nick_name / remark / alias (大小写无关, 空格无关).",
@@ -263,9 +267,10 @@ var toolDefs = []toolDef{
 	{
 		Name: "contacts",
 		Description: "搜索微信联系人或群. 不传 keyword 则列出全部. " +
-			"字段: username / display_name (remark > nick_name > username) / nick_name / remark / alias / " +
-			"pin_yin_initial / type (friend/group/official_account/corp_im/clawbot/stranger/other, 由 username 规则推导) / " +
-			"big_head_url / small_head_url / description / is_in_chat_room / chat_room_type / local_type / verify_flag.",
+			"字段: username / display_name (remark > nick_name > username) / nick_name / " +
+			"remark (omitempty) / alias (omitempty, 微信号) / description (omitempty, 个性签名/群简介) / " +
+			"type (friend/group/official_account/corp_im/clawbot/stranger/other, 由 username 规则推导) / " +
+			"is_verified (bool, 公众号/服务号/认证账号).",
 		InputSchema: jsonSchema(props{
 			"keyword":      strProp("模糊搜索 (匹配 wxid/昵称/备注/alias/拼音首字母)"),
 			"limit":        intProp("返回条数 (默认 50)"),
@@ -277,11 +282,13 @@ var toolDefs = []toolDef{
 		Name: "messages",
 		Description: "会话消息. talker 是 wxid 或 xxx@chatroom. " +
 			"fields=lite (默认) 返回: local_id / server_id / create_time / create_time_human / " +
-			"sender_wxid / sender_display_name / is_from_me / base_kind / kind_name / content_summary. " +
-			"fields=full 额外返回: local_type (packed int64) / subtype / status / sort_seq / " +
-			"message_content (raw 文本/XML) / message_content_parsed (图/表情/app XML 结构化, " +
-			"引用递归 depth=3) / source. " +
-			"base_kind: 1文本/3图/34语音/43视频/47表情/49app/10000系统. " +
+			"sender_wxid / sender_display_name / is_from_me / base_kind / kind_name / content_summary " +
+			"(群聊已剥 'wxid:\\n' 前缀). " +
+			"fields=full 额外返回: subtype / message_content (raw 文本/XML) / " +
+			"message_content_parsed (图/表情/app XML 结构化, 引用递归 depth=3). " +
+			"base_kind: 1=text/3=image/34=voice/42=card/43=video/47=sticker/48=location/49=app/50=voip/10000=system. " +
+			"kind_name 在 base_kind=49 时按 subtype 细化: 5=link/6=file/19=forward_chat/33,36=miniprogram/" +
+			"57=quote/87=announcement/2000=transfer/2001=red_packet/62=pat/51=channel_video/3=music. " +
 			"after/before 接 unix秒 或 2006-01-02 (本地时区).",
 		InputSchema: jsonSchema(props{
 			"talker":  strProp("会话对象 (wxid 或 xxx@chatroom)"),
@@ -448,9 +455,10 @@ func (s *server) toolSessions(a map[string]any) (any, error) {
 		where = append(where, "("+strings.Join(clauses, " OR ")+")")
 	}
 	args = append(args, getInt(a, "limit", 50))
-	rows, err := db.Query(fmt.Sprintf(`SELECT username, type, unread_count, summary,
+	rows, err := db.Query(fmt.Sprintf(`SELECT username, unread_count, summary,
 		last_timestamp, sort_timestamp,
-		last_msg_sender, last_sender_display_name, last_msg_type
+		last_msg_sender AS last_sender_wxid, last_sender_display_name,
+		last_msg_type, last_msg_sub_type
 		FROM SessionTable
 		WHERE %s
 		ORDER BY sort_timestamp DESC
@@ -459,6 +467,16 @@ func (s *server) toolSessions(a map[string]any) (any, error) {
 		return nil, err
 	}
 	s.attachDisplayNames(rows, [2]string{"username", "display_name"})
+	for _, r := range rows {
+		bk, _ := r["last_msg_type"].(int64)
+		st, _ := r["last_msg_sub_type"].(int64)
+		r["last_msg_kind_name"] = kindName(int32(bk), int32(st))
+		for _, k := range []string{"last_sender_wxid", "last_sender_display_name"} {
+			if v, ok := r[k].(string); ok && v == "" {
+				delete(r, k)
+			}
+		}
+	}
 	return rows, nil
 }
 
@@ -497,10 +515,9 @@ func (s *server) toolContacts(a map[string]any) (any, error) {
 	}
 	rows, err := db.Query(fmt.Sprintf(`SELECT username, alias, remark, nick_name,
 		COALESCE(NULLIF(remark, ''), NULLIF(nick_name, ''), username) AS display_name,
-		pin_yin_initial, big_head_url, small_head_url, description,
-		is_in_chat_room, chat_room_type, local_type, verify_flag
+		description, verify_flag
 		FROM contact %s
-		ORDER BY is_in_chat_room DESC, nick_name
+		ORDER BY nick_name
 		LIMIT %d`, wc, getInt(a, "limit", 50)), args...)
 	if err != nil {
 		return nil, err
@@ -508,6 +525,14 @@ func (s *server) toolContacts(a map[string]any) (any, error) {
 	for _, r := range rows {
 		u, _ := r["username"].(string)
 		r["type"] = classifyUsername(u)
+		vf, _ := r["verify_flag"].(int64)
+		r["is_verified"] = vf != 0
+		delete(r, "verify_flag")
+		for _, k := range []string{"alias", "remark", "description"} {
+			if v, ok := r[k].(string); ok && v == "" {
+				delete(r, k)
+			}
+		}
 	}
 	return rows, nil
 }
@@ -574,6 +599,13 @@ func (s *server) toolMessages(a map[string]any) (any, error) {
 			sw, _ := r["sender_wxid"].(string)
 			r["is_from_me"] = (sw == selfWxid)
 		}
+	}
+	for _, r := range rows {
+		delete(r, "real_sender_id")
+		delete(r, "sort_seq")
+		delete(r, "status")
+		delete(r, "source")
+		delete(r, "local_type")
 	}
 	mode := getStr(a, "fields")
 	if mode == "" {
@@ -1392,26 +1424,61 @@ func loadSnsInteractions(db *wcdb.DB, tids []int64) (map[int64][]snsReact, map[i
 // ──────────────────── message_content enrichment ────────────────────
 
 // local_type is a packed int64: (subtype << 32) | base_kind.
-// base_kind names: 1 text, 3 image, 34 voice, 43 video, 47 sticker, 49 app, 10000 system.
-// subtype is meaningful for base_kind=49 (app messages) — e.g. 57=quote-reply (<refermsg>).
+// base_kind covers wechat's top-level message kind; for base_kind=49 the
+// subtype refines the app-message kind (link/file/quote/transfer/...).
+// Mappings sourced from WeFlow (electron/services/{chatService,exportService}).
 var baseKindNames = map[int32]string{
 	1:     "text",
 	3:     "image",
 	34:    "voice",
+	42:    "card",
 	43:    "video",
 	47:    "sticker",
+	48:    "location",
 	49:    "app",
+	50:    "voip",
 	10000: "system",
+}
+
+// appSubtypeNames maps app-message subtype (when base_kind=49) to a precise
+// human-readable kind. Falls back to "app" when subtype is unknown.
+var appSubtypeNames = map[int32]string{
+	3:    "music",
+	5:    "link",
+	6:    "file",
+	8:    "file",
+	19:   "forward_chat",
+	24:   "file",
+	33:   "miniprogram",
+	36:   "miniprogram",
+	49:   "link",
+	51:   "channel_video",
+	57:   "quote",
+	62:   "pat",
+	87:   "announcement",
+	2000: "transfer",
+	2001: "red_packet",
+}
+
+// kindName resolves (base_kind, subtype) to the most specific human-readable
+// label. For base_kind=49 it consults appSubtypeNames first; otherwise uses
+// baseKindNames. Returns "unknown" if neither matches.
+func kindName(baseKind, subtype int32) string {
+	if baseKind == 49 {
+		if n, ok := appSubtypeNames[subtype]; ok {
+			return n
+		}
+	}
+	if n, ok := baseKindNames[baseKind]; ok {
+		return n
+	}
+	return "unknown"
 }
 
 func unpackLocalType(lt int64) (baseKind, subtype int32, name string) {
 	baseKind = int32(lt & 0xFFFFFFFF)
 	subtype = int32(lt >> 32)
-	if n, ok := baseKindNames[baseKind]; ok {
-		name = n
-	} else {
-		name = "unknown"
-	}
+	name = kindName(baseKind, subtype)
 	return
 }
 
@@ -1577,13 +1644,20 @@ func enrichMessages(rows []wcdb.Row) []wcdb.Row {
 	return rows
 }
 
+// senderPrefixRe matches a "wxid:\n" prefix attached to group-chat raw
+// content. WeChat stores group messages as "<senderWxid>:\n<actual text>";
+// this prefix is redundant once sender_wxid is exposed as its own field.
+// Anchored requirement of newline after ':' avoids stripping URLs (https://).
+var senderPrefixRe = regexp.MustCompile(`^\s*[a-zA-Z0-9_@-]+:\s*\r?\n\s*`)
+
 // contentSummary returns a one-line human-readable summary for display.
-// text/system → raw content; media → bracketed placeholder; app → title or
-// quoted-reply composite. Depth-bounded implicitly via parseMessageContent.
+// text/system → raw content (sender prefix stripped); media → bracketed
+// placeholder; app → title or quoted-reply composite. Depth-bounded implicitly
+// via parseMessageContent.
 func contentSummary(baseKind, subtype int32, raw string, parsed any) string {
 	switch baseKind {
 	case 1:
-		return raw
+		return senderPrefixRe.ReplaceAllString(raw, "")
 	case 3:
 		return "[图片]"
 	case 34:
