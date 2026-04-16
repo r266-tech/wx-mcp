@@ -251,7 +251,8 @@ var toolDefs = []toolDef{
 		Description: "聊天会话列表, 按 last_timestamp DESC. " +
 			"字段: display_name / username / type (0私聊/1群) / unread_count / " +
 			"last_timestamp / summary (末条预览) / last_sender_display_name / last_msg_type. " +
-			"type_filter 过滤会话类型. keyword 匹配 username / summary / " +
+			"type_filter 识别: group=@chatroom 后缀, official_account=gh_ 前缀, " +
+			"bot=@weclaw 后缀, friend=其他. keyword 匹配 username / summary / " +
 			"display_name / nick_name / remark / alias (大小写无关, 空格无关).",
 		InputSchema: jsonSchema(props{
 			"limit":       intProp("返回条数 (默认 50)"),
