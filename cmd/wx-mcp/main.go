@@ -302,8 +302,9 @@ var toolDefs = []toolDef{
 	},
 	{
 		Name: "group_members",
-		Description: "群成员. 字段: username / display_name / nick_name / remark / alias / " +
-			"big_head_url / is_owner / is_friend. stats=true 附 message_count (扫消息表较慢).",
+		Description: "群成员. 字段: username / display_name / nick_name / " +
+			"remark (omitempty) / alias (omitempty) / is_owner (bool) / is_friend (bool). " +
+			"stats=true 附 msg_count (扫消息表较慢).",
 		InputSchema: jsonSchema(props{
 			"chatroom_id": strProp("群 ID (xxx@chatroom)"),
 			"stats":       boolProp("附带每人发言条数 (扫消息表, 较慢)"),
@@ -331,7 +332,10 @@ var toolDefs = []toolDef{
 	{
 		Name: "search",
 		Description: "跨会话消息全文搜索 (4 FTS 分区 UNION ALL + 全局时间倒序). " +
-			"字段: content / local_id / session_id / talker / talker_display_name / create_time.",
+			"字段: content (群聊已剥 'wxid:\\n' 前缀) / local_id / talker / talker_display_name / " +
+			"create_time / sender_wxid / sender_display_name / base_kind / kind_name. " +
+			"sender + base_kind/kind_name 来自 join 回 Msg_<hash>(talker), 部分命中可能因 shard 路由失败缺这几字段. " +
+			"FTS 索引可能落后实时几分钟.",
 		InputSchema: jsonSchema(props{
 			"keyword": strProp("搜索关键词"),
 			"limit":   intProp("返回条数 (默认 20)"),
@@ -350,7 +354,11 @@ var toolDefs = []toolDef{
 	},
 	{
 		Name: "transfers",
-		Description: "微信转账记录. message_server_id 对应 messages.server_id (join 拿原消息 XML 含金额). " +
+		Description: "微信转账记录. 字段: transfer_id / transcation_id / session_username / session_display_name / " +
+			"payer_wxid / payer_display_name / receiver_wxid / receiver_display_name / pay_sub_type (raw int) / " +
+			"begin_transfer_time / invalid_time / last_modified_time / message_server_id / " +
+			"amount (从 messages join 出, 如 '￥5.00') / description (人类可读, 如 '收到转账5.00元') / memo (转账留言, omitempty). " +
+			"amount/description/memo 通过 message_server_id 路由到 Msg_<hash>(session_username) 拉 XML 提取, 路由失败缺. " +
 			"after/before 按 begin_transfer_time 过滤, 接 unix秒 或 2006-01-02 (本地时区).",
 		InputSchema: jsonSchema(props{
 			"limit":  intProp("返回条数 (默认 50)"),
@@ -360,15 +368,21 @@ var toolDefs = []toolDef{
 	},
 	{
 		Name: "red_packets",
-		Description: "微信红包记录. message_server_id 对应 messages.server_id. " +
-			"表无时间字段, 按 rowid DESC (近似收到顺序). 要按真实发生时间过滤请用 sql tool JOIN messages via message_server_id.",
+		Description: "微信红包记录. 字段: send_id / sender_wxid / sender_display_name / " +
+			"session_username / session_display_name / native_url (微信红包深链) / message_server_id / " +
+			"wishing (祝福语 如 '恭喜发财大吉大利', 从 join XML 提取) / scene_text (如 '微信红包', omitempty). " +
+			"红包金额随机, 仅领取后可见, 不在本地数据中. " +
+			"表无时间字段, 按 rowid DESC (近似收到顺序). 真实时间过滤请用 sql tool JOIN messages.create_time via message_server_id.",
 		InputSchema: jsonSchema(props{
 			"limit": intProp("返回条数 (默认 50)"),
 		}, nil),
 	},
 	{
 		Name: "favorites",
-		Description: "微信收藏. message_server_id 对应 messages.server_id. " +
+		Description: "微信收藏. 字段: server_id / favorite_type (text/image/voice/video/link/location/file/" +
+			"chat_history/miniprogram/unknown) / type_id (raw int) / update_time / source_id (内部复合 ID) / " +
+			"from_wxid / from_display_name / source_chat_username (omitempty) / source_chat_display_name / " +
+			"content (XML 原文) / title (从 XML 提取, omitempty) / description (omitempty) / url (omitempty). " +
 			"after/before 按 update_time 过滤, 接 unix秒 或 2006-01-02 (本地时区).",
 		InputSchema: jsonSchema(props{
 			"limit":  intProp("返回条数 (默认 50)"),
@@ -378,10 +392,10 @@ var toolDefs = []toolDef{
 	},
 	{
 		Name: "chatroom_announcements",
-		Description: "群公告. 字段: chatroom_id / chatroom_display_name / announcement_ / " +
-			"announcement_editor_ / editor_display_name / announcement_publish_time_ / chat_room_status_. " +
-			"不传 chatroom_id 按 announcement_publish_time_ DESC. " +
-			"after/before 按 announcement_publish_time_ 过滤, 接 unix秒 或 2006-01-02 (本地时区).",
+		Description: "群公告. 字段: chatroom_id / chatroom_display_name / announcement / " +
+			"editor_wxid / editor_display_name / publish_time. " +
+			"不传 chatroom_id 按 publish_time DESC 列所有群公告. " +
+			"after/before 按 publish_time 过滤, 接 unix秒 或 2006-01-02 (本地时区).",
 		InputSchema: jsonSchema(props{
 			"chatroom_id": strProp("群 ID (xxx@chatroom), 不传则返回所有群公告 (按发布时间倒序)"),
 			"limit":       intProp("返回条数 (默认 20)"),
@@ -391,7 +405,8 @@ var toolDefs = []toolDef{
 	},
 	{
 		Name: "forward_history",
-		Description: "最近转发目标. 字段: username / display_name / forward_time. " +
+		Description: "最近转发目标列表 (你最近转发到了哪些会话, 用于快捷转发 UI). " +
+			"非'被转发的消息历史' — 不存消息内容. 字段: username / display_name / forward_time. " +
 			"after/before 按 forward_time 过滤, 接 unix秒 或 2006-01-02 (本地时区).",
 		InputSchema: jsonSchema(props{
 			"limit":  intProp("返回条数 (默认 50)"),
@@ -648,7 +663,7 @@ func (s *server) toolGroupMembers(a map[string]any) (any, error) {
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.Query(`SELECT c.username, c.alias, c.remark, c.nick_name, c.big_head_url,
+	rows, err := db.Query(`SELECT c.username, c.alias, c.remark, c.nick_name,
 		COALESCE(NULLIF(c.remark, ''), NULLIF(c.nick_name, ''), c.username) AS display_name,
 		CASE WHEN cr.owner = c.username THEN 1 ELSE 0 END AS is_owner,
 		CASE WHEN c.local_type = 1 THEN 1 ELSE 0 END AS is_friend
@@ -660,6 +675,19 @@ func (s *server) toolGroupMembers(a map[string]any) (any, error) {
 		LIMIT ? OFFSET ?`, target, getInt(a, "limit", 100), getInt(a, "offset", 0))
 	if err != nil {
 		return nil, err
+	}
+	for _, r := range rows {
+		if v, ok := r["is_owner"].(int64); ok {
+			r["is_owner"] = v != 0
+		}
+		if v, ok := r["is_friend"].(int64); ok {
+			r["is_friend"] = v != 0
+		}
+		for _, k := range []string{"alias", "remark"} {
+			if v, ok := r[k].(string); ok && v == "" {
+				delete(r, k)
+			}
+		}
 	}
 	if !getBool(a, "stats") {
 		return rows, nil
@@ -796,13 +824,15 @@ func (s *server) toolSearch(a map[string]any) (any, error) {
 	defer db.Close()
 
 	// Build session_id → talker mapping from FTS name2id.
+	n2iRows, err := db.Query("SELECT rowid AS rid, username FROM name2id")
+	if err != nil {
+		return nil, fmt.Errorf("search 失败 (name2id): %w", err)
+	}
 	idToTalker := make(map[int64]string)
-	if n2iRows, err := db.Query("SELECT rowid AS rid, username FROM name2id"); err == nil {
-		for _, r := range n2iRows {
-			if rid, ok := r["rid"].(int64); ok {
-				if u, ok := r["username"].(string); ok {
-					idToTalker[rid] = u
-				}
+	for _, r := range n2iRows {
+		if rid, ok := r["rid"].(int64); ok {
+			if u, ok := r["username"].(string); ok {
+				idToTalker[rid] = u
 			}
 		}
 	}
@@ -827,9 +857,83 @@ func (s *server) toolSearch(a map[string]any) (any, error) {
 	for _, r := range rows {
 		sid, _ := r["session_id"].(int64)
 		r["talker"] = idToTalker[sid]
+		delete(r, "session_id")
 	}
-	s.attachDisplayNames(rows, [2]string{"talker", "talker_display_name"})
+	s.enrichSearchSender(rows)
+	s.attachDisplayNames(rows,
+		[2]string{"talker", "talker_display_name"},
+		[2]string{"sender_wxid", "sender_display_name"})
+	for _, r := range rows {
+		if c, ok := r["content"].(string); ok {
+			r["content"] = senderPrefixRe.ReplaceAllString(c, "")
+		}
+	}
 	return rows, nil
+}
+
+// enrichSearchSender resolves sender_wxid + base_kind + kind_name for FTS
+// search hits by joining each (talker, local_id) back to its Msg_<hash> shard.
+// Groups rows by talker → one IN query per talker; missing rows leave the
+// fields absent so caller can distinguish "not enriched" from "no value".
+func (s *server) enrichSearchSender(rows []wcdb.Row) {
+	byTalker := make(map[string][]int64)
+	for _, r := range rows {
+		t, _ := r["talker"].(string)
+		lid, _ := r["local_id"].(int64)
+		if t == "" || lid == 0 {
+			continue
+		}
+		byTalker[t] = append(byTalker[t], lid)
+	}
+	type meta struct {
+		senderWxid string
+		baseKind   int32
+		kindName   string
+	}
+	metaByKey := make(map[string]meta)
+	for talker, lids := range byTalker {
+		tableName := "Msg_" + talkerHash(talker)
+		msgDB, err := s.findMsgDB(tableName)
+		if err != nil {
+			continue
+		}
+		n2i, _ := loadName2Id(msgDB)
+		ph := make([]string, len(lids))
+		args := make([]any, len(lids))
+		for i, lid := range lids {
+			ph[i] = "?"
+			args[i] = lid
+		}
+		metaRows, qerr := msgDB.Query(fmt.Sprintf(
+			"SELECT local_id, real_sender_id, local_type FROM %s WHERE local_id IN (%s)",
+			tableName, strings.Join(ph, ",")), args...)
+		msgDB.Close()
+		if qerr != nil {
+			continue
+		}
+		for _, mr := range metaRows {
+			lid, _ := mr["local_id"].(int64)
+			rsid, _ := mr["real_sender_id"].(int64)
+			lt, _ := mr["local_type"].(int64)
+			bk, _, name := unpackLocalType(lt)
+			m := meta{baseKind: bk, kindName: name}
+			if w, ok := n2i[rsid]; ok {
+				m.senderWxid = w
+			}
+			metaByKey[talker+":"+strconv.FormatInt(lid, 10)] = m
+		}
+	}
+	for _, r := range rows {
+		t, _ := r["talker"].(string)
+		lid, _ := r["local_id"].(int64)
+		if m, ok := metaByKey[t+":"+strconv.FormatInt(lid, 10)]; ok {
+			if m.senderWxid != "" {
+				r["sender_wxid"] = m.senderWxid
+			}
+			r["base_kind"] = m.baseKind
+			r["kind_name"] = m.kindName
+		}
+	}
 }
 
 func (s *server) toolSQL(a map[string]any) (any, error) {
@@ -882,8 +986,9 @@ func (s *server) toolTransfers(a map[string]any) (any, error) {
 		wc = "WHERE " + strings.Join(where, " AND ")
 	}
 	args = append(args, getInt(a, "limit", 50))
-	rows, err := db.Query(fmt.Sprintf(`SELECT transfer_id, transcation_id, session_name,
-		pay_payer, pay_receiver, pay_sub_type,
+	rows, err := db.Query(fmt.Sprintf(`SELECT transfer_id, transcation_id,
+		session_name AS session_username,
+		pay_payer AS payer_wxid, pay_receiver AS receiver_wxid, pay_sub_type,
 		begin_transfer_time, invalid_time, last_modified_time,
 		message_server_id
 		FROM transferTable %s
@@ -892,10 +997,28 @@ func (s *server) toolTransfers(a map[string]any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	contents := s.fetchMessageContent(rows, "message_server_id", "session_username")
+	for _, r := range rows {
+		sid, _ := r["message_server_id"].(int64)
+		c, ok := contents[sid]
+		if !ok {
+			continue
+		}
+		amount, des, memo := extractTransferInfo(c)
+		if amount != "" {
+			r["amount"] = amount
+		}
+		if des != "" {
+			r["description"] = des
+		}
+		if memo != "" {
+			r["memo"] = memo
+		}
+	}
 	s.attachDisplayNames(rows,
-		[2]string{"pay_payer", "payer_display_name"},
-		[2]string{"pay_receiver", "receiver_display_name"},
-		[2]string{"session_name", "session_display_name"})
+		[2]string{"payer_wxid", "payer_display_name"},
+		[2]string{"receiver_wxid", "receiver_display_name"},
+		[2]string{"session_username", "session_display_name"})
 	return rows, nil
 }
 
@@ -905,18 +1028,34 @@ func (s *server) toolRedPackets(a map[string]any) (any, error) {
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.Query(`SELECT send_id, sender_user_name, session_name,
-		hb_type, hb_status, receive_status, scene_id,
-		message_server_id
+	rows, err := db.Query(`SELECT send_id,
+		sender_user_name AS sender_wxid,
+		session_name AS session_username,
+		native_url, message_server_id
 		FROM redEnvelopeTable
 		ORDER BY rowid DESC
 		LIMIT ?`, getInt(a, "limit", 50))
 	if err != nil {
 		return nil, err
 	}
+	contents := s.fetchMessageContent(rows, "message_server_id", "session_username")
+	for _, r := range rows {
+		sid, _ := r["message_server_id"].(int64)
+		c, ok := contents[sid]
+		if !ok {
+			continue
+		}
+		wishing, sceneText := extractRedPacketInfo(c)
+		if wishing != "" {
+			r["wishing"] = wishing
+		}
+		if sceneText != "" {
+			r["scene_text"] = sceneText
+		}
+	}
 	s.attachDisplayNames(rows,
-		[2]string{"sender_user_name", "sender_display_name"},
-		[2]string{"session_name", "session_display_name"})
+		[2]string{"sender_wxid", "sender_display_name"},
+		[2]string{"session_username", "session_display_name"})
 	return rows, nil
 }
 
@@ -949,15 +1088,41 @@ func (s *server) toolFavorites(a map[string]any) (any, error) {
 		wc = "WHERE " + strings.Join(where, " AND ")
 	}
 	args = append(args, getInt(a, "limit", 50))
-	rows, err := db.Query(fmt.Sprintf(`SELECT local_id, server_id, type, update_seq, flag,
-		update_time, source_id, fromusr
+	rows, err := db.Query(fmt.Sprintf(`SELECT server_id,
+		type AS type_id, update_time, source_id, content,
+		fromusr AS from_wxid,
+		realchatname AS source_chat_username
 		FROM fav_db_item %s
-		ORDER BY update_seq DESC
+		ORDER BY update_time DESC
 		LIMIT ?`, wc), args...)
 	if err != nil {
 		return nil, err
 	}
-	s.attachDisplayNames(rows, [2]string{"fromusr", "from_display_name"})
+	for _, r := range rows {
+		ti, _ := r["type_id"].(int64)
+		r["favorite_type"] = favKindName(ti)
+		if c, ok := r["content"].(string); ok && c != "" {
+			if title, desc, url := extractFavoriteInfo(c); title != "" || desc != "" || url != "" {
+				if title != "" {
+					r["title"] = title
+				}
+				if desc != "" {
+					r["description"] = desc
+				}
+				if url != "" {
+					r["url"] = url
+				}
+			}
+		}
+		for _, k := range []string{"source_chat_username"} {
+			if v, ok := r[k].(string); ok && v == "" {
+				delete(r, k)
+			}
+		}
+	}
+	s.attachDisplayNames(rows,
+		[2]string{"from_wxid", "from_display_name"},
+		[2]string{"source_chat_username", "source_chat_display_name"})
 	return rows, nil
 }
 
@@ -993,8 +1158,10 @@ func (s *server) toolChatroomAnnouncements(a map[string]any) (any, error) {
 		args = append(args, ts)
 	}
 	args = append(args, limit)
-	rows, err := db.Query(fmt.Sprintf(`SELECT username_ AS chatroom_id, announcement_, announcement_editor_,
-		announcement_publish_time_, chat_room_status_
+	rows, err := db.Query(fmt.Sprintf(`SELECT username_ AS chatroom_id,
+		announcement_ AS announcement,
+		announcement_editor_ AS editor_wxid,
+		announcement_publish_time_ AS publish_time
 		FROM chat_room_info_detail
 		WHERE %s
 		ORDER BY announcement_publish_time_ DESC
@@ -1004,11 +1171,14 @@ func (s *server) toolChatroomAnnouncements(a map[string]any) (any, error) {
 	}
 	s.attachDisplayNames(rows,
 		[2]string{"chatroom_id", "chatroom_display_name"},
-		[2]string{"announcement_editor_", "editor_display_name"})
+		[2]string{"editor_wxid", "editor_display_name"})
 	return rows, nil
 }
 
 func (s *server) toolSchema(a map[string]any) (any, error) {
+	if err := s.ensure(); err != nil {
+		return nil, err
+	}
 	subdir := getStr(a, "subdir")
 	file := getStr(a, "file")
 	if subdir != "" && file != "" {
@@ -1031,7 +1201,8 @@ func (s *server) toolSchema(a map[string]any) (any, error) {
 		Subdir     string   `json:"subdir"`
 		File       string   `json:"file"`
 		ShardCount int      `json:"shard_count,omitempty"`
-		Tables     []string `json:"tables"`
+		Tables     []string `json:"tables,omitempty"`
+		Error      string   `json:"error,omitempty"`
 	}
 	var result []out
 	for _, e := range entries {
@@ -1041,6 +1212,7 @@ func (s *server) toolSchema(a map[string]any) (any, error) {
 		sub := e.Name()
 		files, err := os.ReadDir(filepath.Join(dbRoot, sub))
 		if err != nil {
+			result = append(result, out{Subdir: sub, Error: err.Error()})
 			continue
 		}
 		var canonical string
@@ -1064,6 +1236,7 @@ func (s *server) toolSchema(a map[string]any) (any, error) {
 		}
 		db, err := s.openDB(sub, canonical)
 		if err != nil {
+			result = append(result, out{Subdir: sub, File: canonical, ShardCount: shardCount, Error: err.Error()})
 			continue
 		}
 		rows, err := db.Query(`SELECT name FROM sqlite_master
@@ -1071,6 +1244,7 @@ func (s *server) toolSchema(a map[string]any) (any, error) {
 			ORDER BY name`)
 		db.Close()
 		if err != nil {
+			result = append(result, out{Subdir: sub, File: canonical, ShardCount: shardCount, Error: err.Error()})
 			continue
 		}
 		tables := make([]string, 0, len(rows))
@@ -1531,6 +1705,156 @@ type xmlMsgReferMsg struct {
 	SvrID       string `xml:"svrid"`
 	FromUsr     string `xml:"fromusr"`
 	Content     string `xml:"content"`
+}
+
+// xmlTransferMsg parses wechat transfer (subtype=2000) messages. Amount is in
+// wcpayinfo.feedesc ("￥5.00"); appmsg.des is human-readable summary
+// ("收到转账5.00元"); pay_memo is sender's note attached to the transfer.
+type xmlTransferMsg struct {
+	XMLName xml.Name `xml:"msg"`
+	AppMsg  struct {
+		Des       string `xml:"des"`
+		WcPayInfo struct {
+			FeeDesc    string `xml:"feedesc"`
+			PaySubType int    `xml:"paysubtype"`
+			PayMemo    string `xml:"pay_memo"`
+		} `xml:"wcpayinfo"`
+	} `xml:"appmsg"`
+}
+
+func extractTransferInfo(content string) (amount, des, memo string) {
+	var t xmlTransferMsg
+	if err := xml.Unmarshal([]byte(stripMsgPrefix(content)), &t); err != nil {
+		return
+	}
+	return t.AppMsg.WcPayInfo.FeeDesc, t.AppMsg.Des, t.AppMsg.WcPayInfo.PayMemo
+}
+
+// favTypeNames maps wechat favorite kind ints to a human-readable label.
+// Source: WeChat client schema (CDataItem types). 20 occasionally seen but
+// undocumented — falls back to "unknown".
+var favTypeNames = map[int64]string{
+	1:  "text",
+	2:  "image",
+	3:  "voice",
+	4:  "video",
+	5:  "link",
+	6:  "location",
+	8:  "file",
+	14: "chat_history",
+	18: "miniprogram",
+}
+
+func favKindName(t int64) string {
+	if n, ok := favTypeNames[t]; ok {
+		return n
+	}
+	return "unknown"
+}
+
+// xmlFavItem covers the most common favorite XML shapes (link / note / data).
+// title/desc/url fields fall through whichever sub-item element is populated.
+type xmlFavItem struct {
+	XMLName    xml.Name `xml:"favitem"`
+	WebURLItem struct {
+		PageTitle string `xml:"pagetitle"`
+		PageDesc  string `xml:"pagedesc"`
+		CleanURL  string `xml:"clean_url"`
+	} `xml:"weburlitem"`
+	NoteItem struct {
+		Title       string `xml:"title"`
+		Description string `xml:"description"`
+	} `xml:"noteitem"`
+	DataItem struct {
+		DataTitle string `xml:"datatitle"`
+		DataDesc  string `xml:"datadesc"`
+	} `xml:"dataitem"`
+}
+
+func extractFavoriteInfo(content string) (title, desc, url string) {
+	var f xmlFavItem
+	if err := xml.Unmarshal([]byte(content), &f); err != nil {
+		return
+	}
+	switch {
+	case f.WebURLItem.PageTitle != "":
+		return f.WebURLItem.PageTitle, f.WebURLItem.PageDesc, f.WebURLItem.CleanURL
+	case f.NoteItem.Title != "":
+		return f.NoteItem.Title, f.NoteItem.Description, ""
+	case f.DataItem.DataTitle != "":
+		return f.DataItem.DataTitle, f.DataItem.DataDesc, ""
+	}
+	return
+}
+
+// xmlRedPacketMsg parses wechat red-packet (subtype=2001) messages.
+// sendertitle is sender-side wishing text; nativeurl carries the deep link;
+// scenetext distinguishes 1v1 / group / luck-draw scenarios.
+type xmlRedPacketMsg struct {
+	XMLName xml.Name `xml:"msg"`
+	AppMsg  struct {
+		WcPayInfo struct {
+			SenderTitle    string `xml:"sendertitle"`
+			ReceiverTitle  string `xml:"receivertitle"`
+			SceneText      string `xml:"scenetext"`
+			TemplateID     string `xml:"templateid"`
+			InnerType      int    `xml:"innertype"`
+			NativeURL      string `xml:"nativeurl"`
+		} `xml:"wcpayinfo"`
+	} `xml:"appmsg"`
+}
+
+func extractRedPacketInfo(content string) (wishing, sceneText string) {
+	var r xmlRedPacketMsg
+	if err := xml.Unmarshal([]byte(stripMsgPrefix(content)), &r); err != nil {
+		return
+	}
+	return r.AppMsg.WcPayInfo.SenderTitle, r.AppMsg.WcPayInfo.SceneText
+}
+
+// fetchMessageContent batch-loads message_content (zstd decoded) for a list of
+// (talker, server_id) pairs. Groups by talker → routes to the matching
+// Msg_<hash> shard → single IN query per talker. Returns server_id → content
+// map; entries missing means lookup failed (table not found / row gone) and
+// caller should treat the enrichment field as absent rather than error.
+func (s *server) fetchMessageContent(rows []wcdb.Row, sidCol, talkerCol string) map[int64]string {
+	byTalker := make(map[string][]int64)
+	for _, r := range rows {
+		t, _ := r[talkerCol].(string)
+		sid, _ := r[sidCol].(int64)
+		if t == "" || sid == 0 {
+			continue
+		}
+		byTalker[t] = append(byTalker[t], sid)
+	}
+	out := make(map[int64]string)
+	for talker, sids := range byTalker {
+		tableName := "Msg_" + talkerHash(talker)
+		msgDB, err := s.findMsgDB(tableName)
+		if err != nil {
+			continue
+		}
+		ph := make([]string, len(sids))
+		args := make([]any, len(sids))
+		for i, sid := range sids {
+			ph[i] = "?"
+			args[i] = sid
+		}
+		contentRows, qerr := msgDB.Query(fmt.Sprintf(
+			"SELECT server_id, message_content FROM %s WHERE server_id IN (%s)",
+			tableName, strings.Join(ph, ",")), args...)
+		msgDB.Close()
+		if qerr != nil {
+			continue
+		}
+		decoded := decodeFields(contentRows, "message_content")
+		for _, cr := range decoded {
+			sid, _ := cr["server_id"].(int64)
+			content, _ := cr["message_content"].(string)
+			out[sid] = content
+		}
+	}
+	return out
 }
 
 // stripMsgPrefix trims the "wxid_xxx:\n" sender prefix WeChat prepends to
