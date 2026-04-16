@@ -261,8 +261,11 @@ var toolDefs = []toolDef{
 		}, nil),
 	},
 	{
-		Name:        "contacts",
-		Description: "搜索微信联系人或群. 不传 keyword 则列出全部",
+		Name: "contacts",
+		Description: "搜索微信联系人或群. 不传 keyword 则列出全部. " +
+			"字段: username / display_name (remark > nick_name > username) / nick_name / remark / alias / " +
+			"pin_yin_initial / type (friend/group/official_account/corp_im/clawbot/stranger/other, 由 username 规则推导) / " +
+			"big_head_url / small_head_url / description / is_in_chat_room / chat_room_type / local_type / verify_flag.",
 		InputSchema: jsonSchema(props{
 			"keyword":      strProp("模糊搜索 (匹配 wxid/昵称/备注/alias/拼音首字母)"),
 			"limit":        intProp("返回条数 (默认 50)"),
@@ -302,8 +305,13 @@ var toolDefs = []toolDef{
 		}, []string{"chatroom_id"}),
 	},
 	{
-		Name:        "sns",
-		Description: "朋友圈 timeline, 含点赞和评论",
+		Name: "sns",
+		Description: "朋友圈 timeline. 返回字段: tid / username / nickname / avatar_url / " +
+			"create_time / content / type / private / liked_by_me / " +
+			"media (type/url/thumb/width/height) / location (name/lat/lon) / " +
+			"likes ([username, nickname]) / " +
+			"comments ([username, nickname, content, create_time, reply_to, reply_to_nick]). " +
+			"时间过滤针对 XML 里的 createTime (非 SQL tid), 先按 tid DESC 粗拉再解析过滤.",
 		InputSchema: jsonSchema(props{
 			"keyword": strProp("正文关键词"),
 			"user":    strProp("按发布者 wxid 过滤"),
@@ -323,8 +331,10 @@ var toolDefs = []toolDef{
 		}, []string{"keyword"}),
 	},
 	{
-		Name:        "sql",
-		Description: "本地 WCDB 只读 SQL. db 位置由 subdir/file 定位. 用 schema tool 列出有哪些 db 和表.",
+		Name: "sql",
+		Description: "本地 WCDB SQL. OS 级 readonly (SQLITE_OPEN_READONLY 打开), DDL/DML 会 rc≠0 直接报错 — " +
+			"CTE / subquery / temp view / EXPLAIN 等只读构造都安全. " +
+			"db 位置由 subdir/file 定位. 用 schema tool 列出有哪些 db 和表.",
 		InputSchema: jsonSchema(props{
 			"query":  strProp("SQL 语句"),
 			"subdir": strProp("db_storage 下的子目录 (默认 session)"),
@@ -625,12 +635,18 @@ func (s *server) toolGroupMembers(a map[string]any) (any, error) {
 	tableName := "Msg_" + talkerHash(target)
 	msgDB, err := s.findMsgDB(tableName)
 	if err != nil {
-		return rows, nil // return without stats on error
+		return nil, fmt.Errorf("stats=true 失败 (%s): %w", tableName, err)
 	}
 	defer msgDB.Close()
-	n2i, _ := loadName2Id(msgDB)
-	countRows, _ := msgDB.Query(fmt.Sprintf(
+	n2i, err := loadName2Id(msgDB)
+	if err != nil {
+		return nil, fmt.Errorf("stats=true 失败 (loadName2Id): %w", err)
+	}
+	countRows, err := msgDB.Query(fmt.Sprintf(
 		"SELECT real_sender_id, COUNT(*) AS cnt FROM %s GROUP BY real_sender_id", tableName))
+	if err != nil {
+		return nil, fmt.Errorf("stats=true 失败 (count query): %w", err)
+	}
 	counts := make(map[string]int64)
 	for _, r := range countRows {
 		id, _ := r["real_sender_id"].(int64)
