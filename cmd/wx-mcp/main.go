@@ -197,7 +197,7 @@ func (s *server) handle(req rpcRequest) rpcResponse {
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
 			"protocolVersion": "2024-11-05",
 			"capabilities":   map[string]any{"tools": map[string]any{}},
-			"serverInfo":     map[string]any{"name": "wx-mcp", "version": "1.0.0"},
+			"serverInfo":     map[string]any{"name": "wx-mcp", "version": "1.1.0"},
 		}}
 	case "tools/list":
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": toolDefs}}
@@ -283,10 +283,12 @@ var toolDefs = []toolDef{
 	},
 	{
 		Name:        "group_members",
-		Description: "列出群成员. 可选附带每人发言数统计",
+		Description: "列出群成员 (默认 limit=100, 大群必须分页)",
 		InputSchema: jsonSchema(props{
 			"chatroom_id": strProp("群 ID (xxx@chatroom)"),
 			"stats":       boolProp("附带每人发言条数 (扫消息表, 较慢)"),
+			"limit":       intProp("返回条数 (默认 100)"),
+			"offset":      intProp("跳过条数 (默认 0)"),
 		}, []string{"chatroom_id"}),
 	},
 	{
@@ -341,9 +343,10 @@ var toolDefs = []toolDef{
 	},
 	{
 		Name:        "chatroom_announcements",
-		Description: "群公告",
+		Description: "群公告 (公告正文可能很长, 默认 limit=20 防 token 爆炸)",
 		InputSchema: jsonSchema(props{
-			"chatroom_id": strProp("群 ID (xxx@chatroom), 不传则返回所有群公告"),
+			"chatroom_id": strProp("群 ID (xxx@chatroom), 不传则返回所有群公告 (按发布时间倒序)"),
+			"limit":       intProp("返回条数 (默认 20)"),
 		}, nil),
 	},
 	{
@@ -372,13 +375,18 @@ func (s *server) toolSessions(a map[string]any) (any, error) {
 		args = append(args, like, like)
 	}
 	args = append(args, getInt(a, "limit", 50))
-	return db.Query(fmt.Sprintf(`SELECT username, type, unread_count, summary,
+	rows, err := db.Query(fmt.Sprintf(`SELECT username, type, unread_count, summary,
 		last_timestamp, sort_timestamp,
 		last_msg_sender, last_sender_display_name, last_msg_type
 		FROM SessionTable
 		WHERE %s
 		ORDER BY sort_timestamp DESC
 		LIMIT ?`, strings.Join(where, " AND ")), args...)
+	if err != nil {
+		return nil, err
+	}
+	s.attachDisplayNames(rows, [2]string{"username", "display_name"})
+	return rows, nil
 }
 
 func (s *server) toolContacts(a map[string]any) (any, error) {
@@ -404,12 +412,21 @@ func (s *server) toolContacts(a map[string]any) (any, error) {
 	if len(where) > 0 {
 		wc = "WHERE " + strings.Join(where, " AND ")
 	}
-	return db.Query(fmt.Sprintf(`SELECT username, alias, remark, nick_name,
+	rows, err := db.Query(fmt.Sprintf(`SELECT username, alias, remark, nick_name,
+		COALESCE(NULLIF(remark, ''), NULLIF(nick_name, ''), username) AS display_name,
 		pin_yin_initial, big_head_url, small_head_url, description,
 		is_in_chat_room, chat_room_type, local_type, verify_flag
 		FROM contact %s
 		ORDER BY is_in_chat_room DESC, nick_name
 		LIMIT %d`, wc, getInt(a, "limit", 50)), args...)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		u, _ := r["username"].(string)
+		r["type"] = classifyUsername(u)
+	}
+	return rows, nil
 }
 
 func (s *server) toolMessages(a map[string]any) (any, error) {
@@ -467,7 +484,9 @@ func (s *server) toolMessages(a map[string]any) (any, error) {
 	if m, _ := loadName2Id(db); m != nil {
 		rows = resolveSenders(rows, m)
 	}
-	return enrichMessages(decodeFields(rows, "message_content", "source")), nil
+	rows = enrichMessages(decodeFields(rows, "message_content", "source"))
+	s.attachDisplayNames(rows, [2]string{"sender_wxid", "sender_display_name"})
+	return rows, nil
 }
 
 func (s *server) toolGroupMembers(a map[string]any) (any, error) {
@@ -481,12 +500,15 @@ func (s *server) toolGroupMembers(a map[string]any) (any, error) {
 	}
 	defer db.Close()
 	rows, err := db.Query(`SELECT c.username, c.alias, c.remark, c.nick_name, c.big_head_url,
-		CASE WHEN cr.owner = c.username THEN 1 ELSE 0 END AS is_owner
+		COALESCE(NULLIF(c.remark, ''), NULLIF(c.nick_name, ''), c.username) AS display_name,
+		CASE WHEN cr.owner = c.username THEN 1 ELSE 0 END AS is_owner,
+		CASE WHEN c.local_type = 1 THEN 1 ELSE 0 END AS is_friend
 		FROM chat_room cr
 		JOIN chatroom_member cm ON cm.room_id = cr.id
 		JOIN contact c ON c.id = cm.member_id
 		WHERE cr.username = ?
-		ORDER BY COALESCE(NULLIF(c.remark, ''), c.nick_name, c.username)`, target)
+		ORDER BY COALESCE(NULLIF(c.remark, ''), c.nick_name, c.username)
+		LIMIT ? OFFSET ?`, target, getInt(a, "limit", 100), getInt(a, "offset", 0))
 	if err != nil {
 		return nil, err
 	}
@@ -598,6 +620,7 @@ func (s *server) toolSns(a map[string]any) (any, error) {
 			posts[i].Likes = likes[tid]
 			posts[i].Comments = comments[tid]
 		}
+		s.attachSnsAvatars(posts)
 	}
 	return posts, nil
 }
@@ -650,6 +673,7 @@ func (s *server) toolSearch(a map[string]any) (any, error) {
 		sid, _ := r["session_id"].(int64)
 		r["talker"] = idToTalker[sid]
 	}
+	s.attachDisplayNames(rows, [2]string{"talker", "talker_display_name"})
 	return rows, nil
 }
 
@@ -680,13 +704,21 @@ func (s *server) toolTransfers(a map[string]any) (any, error) {
 		return nil, err
 	}
 	defer db.Close()
-	return db.Query(`SELECT transfer_id, transcation_id, session_name,
+	rows, err := db.Query(`SELECT transfer_id, transcation_id, session_name,
 		pay_payer, pay_receiver, pay_sub_type,
 		begin_transfer_time, invalid_time, last_modified_time,
 		message_server_id
 		FROM transferTable
 		ORDER BY begin_transfer_time DESC
 		LIMIT ?`, getInt(a, "limit", 50))
+	if err != nil {
+		return nil, err
+	}
+	s.attachDisplayNames(rows,
+		[2]string{"pay_payer", "payer_display_name"},
+		[2]string{"pay_receiver", "receiver_display_name"},
+		[2]string{"session_name", "session_display_name"})
+	return rows, nil
 }
 
 func (s *server) toolRedPackets(a map[string]any) (any, error) {
@@ -695,12 +727,19 @@ func (s *server) toolRedPackets(a map[string]any) (any, error) {
 		return nil, err
 	}
 	defer db.Close()
-	return db.Query(`SELECT send_id, sender_user_name, session_name,
+	rows, err := db.Query(`SELECT send_id, sender_user_name, session_name,
 		hb_type, hb_status, receive_status, scene_id,
 		message_server_id
 		FROM redEnvelopeTable
 		ORDER BY rowid DESC
 		LIMIT ?`, getInt(a, "limit", 50))
+	if err != nil {
+		return nil, err
+	}
+	s.attachDisplayNames(rows,
+		[2]string{"sender_user_name", "sender_display_name"},
+		[2]string{"session_name", "session_display_name"})
+	return rows, nil
 }
 
 func (s *server) toolFavorites(a map[string]any) (any, error) {
@@ -709,11 +748,16 @@ func (s *server) toolFavorites(a map[string]any) (any, error) {
 		return nil, err
 	}
 	defer db.Close()
-	return db.Query(`SELECT local_id, server_id, type, update_seq, flag,
+	rows, err := db.Query(`SELECT local_id, server_id, type, update_seq, flag,
 		update_time, source_id, fromusr
 		FROM fav_db_item
 		ORDER BY update_seq DESC
 		LIMIT ?`, getInt(a, "limit", 50))
+	if err != nil {
+		return nil, err
+	}
+	s.attachDisplayNames(rows, [2]string{"fromusr", "from_display_name"})
+	return rows, nil
 }
 
 func (s *server) toolChatroomAnnouncements(a map[string]any) (any, error) {
@@ -722,16 +766,28 @@ func (s *server) toolChatroomAnnouncements(a map[string]any) (any, error) {
 		return nil, err
 	}
 	defer db.Close()
+	limit := getInt(a, "limit", 20)
+	var rows []wcdb.Row
 	if cid := getStr(a, "chatroom_id"); cid != "" {
-		return db.Query(`SELECT username_, announcement_, announcement_editor_,
+		rows, err = db.Query(`SELECT username_ AS chatroom_id, announcement_, announcement_editor_,
 			announcement_publish_time_, chat_room_status_
-			FROM chat_room_info_detail WHERE username_ = ?`, cid)
+			FROM chat_room_info_detail WHERE username_ = ?
+			LIMIT ?`, cid, limit)
+	} else {
+		rows, err = db.Query(`SELECT username_ AS chatroom_id, announcement_, announcement_editor_,
+			announcement_publish_time_, chat_room_status_
+			FROM chat_room_info_detail
+			WHERE announcement_ IS NOT NULL AND announcement_ != ''
+			ORDER BY announcement_publish_time_ DESC
+			LIMIT ?`, limit)
 	}
-	return db.Query(`SELECT username_ AS chatroom_id, announcement_, announcement_editor_,
-		announcement_publish_time_, chat_room_status_
-		FROM chat_room_info_detail
-		WHERE announcement_ IS NOT NULL AND announcement_ != ''
-		ORDER BY announcement_publish_time_ DESC`)
+	if err != nil {
+		return nil, err
+	}
+	s.attachDisplayNames(rows,
+		[2]string{"chatroom_id", "chatroom_display_name"},
+		[2]string{"announcement_editor_", "editor_display_name"})
+	return rows, nil
 }
 
 func (s *server) toolForwardHistory(a map[string]any) (any, error) {
@@ -740,10 +796,15 @@ func (s *server) toolForwardHistory(a map[string]any) (any, error) {
 		return nil, err
 	}
 	defer db.Close()
-	return db.Query(`SELECT username, forward_time
+	rows, err := db.Query(`SELECT username, forward_time
 		FROM ForwardRecent
 		ORDER BY forward_time DESC
 		LIMIT ?`, getInt(a, "limit", 50))
+	if err != nil {
+		return nil, err
+	}
+	s.attachDisplayNames(rows, [2]string{"username", "display_name"})
+	return rows, nil
 }
 
 // ──────────────────── helpers ────────────────────
@@ -936,11 +997,12 @@ type snsPost struct {
 	TID        string     `json:"tid"`
 	Username   string     `json:"username"`
 	Nickname   string     `json:"nickname"`
+	AvatarURL  string     `json:"avatar_url,omitempty"`
 	CreateTime int64      `json:"create_time"`
 	Content    string     `json:"content"`
 	Type       int        `json:"type"`
 	Private    bool       `json:"private,omitempty"`
-	LikedByMe bool       `json:"liked_by_me,omitempty"`
+	LikedByMe  bool       `json:"liked_by_me,omitempty"`
 	Media      []snsMedia `json:"media,omitempty"`
 	Location   *snsLoc    `json:"location,omitempty"`
 	Likes      []snsReact `json:"likes,omitempty"`
@@ -1202,8 +1264,9 @@ func parseMessageContent(baseKind, subtype int32, raw string, depth int) any {
 	return nil
 }
 
-// enrichMessages augments raw message rows with packed-type decoding and a
-// structured message_content_parsed sibling field. Raw local_type and
+// enrichMessages augments raw message rows with packed-type decoding, a
+// structured message_content_parsed sibling field, and a one-line
+// content_summary suitable for agent display. Raw local_type and
 // message_content are always preserved.
 func enrichMessages(rows []wcdb.Row) []wcdb.Row {
 	for _, row := range rows {
@@ -1215,11 +1278,195 @@ func enrichMessages(rows []wcdb.Row) []wcdb.Row {
 		row["base_kind"] = baseKind
 		row["subtype"] = subtype
 		row["kind_name"] = name
-		if content, ok := row["message_content"].(string); ok {
+		content, _ := row["message_content"].(string)
+		if content != "" {
 			if parsed := parseMessageContent(baseKind, subtype, content, 3); parsed != nil {
 				row["message_content_parsed"] = parsed
 			}
 		}
+		row["content_summary"] = contentSummary(baseKind, subtype, content, row["message_content_parsed"])
 	}
 	return rows
+}
+
+// contentSummary returns a one-line human-readable summary for display.
+// text/system → raw content; media → bracketed placeholder; app → title or
+// quoted-reply composite. Depth-bounded implicitly via parseMessageContent.
+func contentSummary(baseKind, subtype int32, raw string, parsed any) string {
+	switch baseKind {
+	case 1:
+		return raw
+	case 3:
+		return "[图片]"
+	case 34:
+		return "[语音]"
+	case 43:
+		return "[视频]"
+	case 47:
+		return "[表情]"
+	case 49:
+		p, _ := parsed.(map[string]any)
+		if p == nil {
+			return "[应用消息]"
+		}
+		title, _ := p["title"].(string)
+		if subtype == 57 {
+			quoted := "..."
+			if r, ok := p["refermsg"].(map[string]any); ok {
+				refType := int32(0)
+				if t, ok := r["type"].(int); ok {
+					refType = int32(t)
+				}
+				refRaw, _ := r["content_raw"].(string)
+				quoted = contentSummary(refType, 0, refRaw, r["content_parsed"])
+			}
+			if title != "" {
+				return "[引用: " + quoted + "] " + title
+			}
+			return "[引用: " + quoted + "]"
+		}
+		if title != "" {
+			return title
+		}
+		return "[应用消息]"
+	case 10000:
+		return raw
+	}
+	return fmt.Sprintf("[未知类型 base_kind=%d]", baseKind)
+}
+
+// classifyUsername maps a raw username to a human-readable type by well-known
+// patterns (suffix/prefix). Stable across schema changes since it depends only
+// on the username string shape, not local_type which varies by WeChat version.
+func classifyUsername(u string) string {
+	switch {
+	case strings.HasSuffix(u, "@chatroom"):
+		return "group"
+	case strings.HasPrefix(u, "gh_"):
+		return "official_account"
+	case strings.HasSuffix(u, "@openim"):
+		return "corp_im"
+	case strings.HasSuffix(u, "@weclaw"):
+		return "clawbot"
+	case strings.HasSuffix(u, "@stranger"):
+		return "stranger"
+	case strings.HasPrefix(u, "wxid_"):
+		return "friend"
+	}
+	return "other"
+}
+
+// lookupDisplayNames batch-queries contact.db for remark > nick_name > username
+// preference per wxid. Returns nil on error.
+func (s *server) lookupDisplayNames(names map[string]bool) map[string]string {
+	if len(names) == 0 {
+		return nil
+	}
+	db, err := s.openDB("contact", "contact.db")
+	if err != nil {
+		return nil
+	}
+	defer db.Close()
+	ph := make([]string, 0, len(names))
+	args := make([]any, 0, len(names))
+	for n := range names {
+		ph = append(ph, "?")
+		args = append(args, n)
+	}
+	q := fmt.Sprintf(`SELECT username,
+		COALESCE(NULLIF(remark, ''), NULLIF(nick_name, ''), username) AS dn
+		FROM contact WHERE username IN (%s)`, strings.Join(ph, ","))
+	cr, err := db.Query(q, args...)
+	if err != nil {
+		return nil
+	}
+	m := make(map[string]string)
+	for _, r := range cr {
+		u, _ := r["username"].(string)
+		dn, _ := r["dn"].(string)
+		if dn != "" {
+			m[u] = dn
+		}
+	}
+	return m
+}
+
+// attachDisplayNames fills one or more display_name fields on rows by looking
+// up usernames from contact.db. Each pair is [sourceField, targetField].
+// Missing lookups fall back to the raw username so the target field is always
+// populated (never undefined in agent-side JSON).
+func (s *server) attachDisplayNames(rows []wcdb.Row, pairs ...[2]string) {
+	if len(rows) == 0 || len(pairs) == 0 {
+		return
+	}
+	names := make(map[string]bool)
+	for _, r := range rows {
+		for _, p := range pairs {
+			if v, ok := r[p[0]].(string); ok && v != "" {
+				names[v] = true
+			}
+		}
+	}
+	m := s.lookupDisplayNames(names)
+	if m == nil {
+		m = make(map[string]string)
+	}
+	for _, r := range rows {
+		for _, p := range pairs {
+			v, _ := r[p[0]].(string)
+			if v == "" {
+				continue
+			}
+			if dn, ok := m[v]; ok {
+				r[p[1]] = dn
+			} else {
+				r[p[1]] = v
+			}
+		}
+	}
+}
+
+// attachSnsAvatars batch-queries contact.big_head_url and attaches AvatarURL
+// to each post. Silent on errors.
+func (s *server) attachSnsAvatars(posts []*snsPost) {
+	if len(posts) == 0 {
+		return
+	}
+	names := make(map[string]bool)
+	for _, p := range posts {
+		if p.Username != "" {
+			names[p.Username] = true
+		}
+	}
+	if len(names) == 0 {
+		return
+	}
+	db, err := s.openDB("contact", "contact.db")
+	if err != nil {
+		return
+	}
+	defer db.Close()
+	ph := make([]string, 0, len(names))
+	args := make([]any, 0, len(names))
+	for n := range names {
+		ph = append(ph, "?")
+		args = append(args, n)
+	}
+	rows, err := db.Query(fmt.Sprintf(
+		"SELECT username, big_head_url FROM contact WHERE username IN (%s)",
+		strings.Join(ph, ",")), args...)
+	if err != nil {
+		return
+	}
+	m := make(map[string]string)
+	for _, r := range rows {
+		u, _ := r["username"].(string)
+		url, _ := r["big_head_url"].(string)
+		m[u] = url
+	}
+	for _, p := range posts {
+		if url, ok := m[p.Username]; ok {
+			p.AvatarURL = url
+		}
+	}
 }
