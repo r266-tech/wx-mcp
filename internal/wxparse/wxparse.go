@@ -104,3 +104,97 @@ func FavoriteInfo(content string) (title, desc, url string) {
 	}
 	return
 }
+
+// xmlForwardMsg parses forward_chat (base_kind=49, subtype=19) messages.
+// recorditem wraps its recordinfo payload in CDATA; ,chardata reads it as
+// plain text (Go's xml parser auto-unwraps CDATA into character data), which
+// we then unmarshal as a separate XML document.
+// datatype attr: 1=text, 2=image, 3=voice, 4=video, 5=link, 8=file, 17=nested forward_chat.
+type xmlForwardMsg struct {
+	XMLName xml.Name `xml:"msg"`
+	AppMsg  struct {
+		Title      string `xml:"title"`
+		Des        string `xml:"des"`
+		RecordItem string `xml:"recorditem"`
+	} `xml:"appmsg"`
+}
+
+// xmlForwardRecordInfo is the inner XML inside <recorditem> CDATA.
+type xmlForwardRecordInfo struct {
+	XMLName   xml.Name         `xml:"recordinfo"`
+	Title     string           `xml:"title"`
+	Desc      string           `xml:"desc"`
+	DataItems []xmlForwardItem `xml:"datalist>dataitem"`
+}
+
+// xmlForwardItem is one dataitem within a recordinfo datalist.
+type xmlForwardItem struct {
+	DataType         int    `xml:"datatype,attr"`
+	DataID           string `xml:"dataid,attr"`
+	SourceName       string `xml:"sourcename"`
+	SourceTime       string `xml:"sourcetime"`
+	DataTitle        string `xml:"datatitle"`
+	DataDesc         string `xml:"datadesc"`
+	DataFmt          string `xml:"datafmt"`
+	FullMD5          string `xml:"fullmd5"`
+	DataSize         int64  `xml:"datasize"`
+	CdnThumbURL      string `xml:"cdnthumburl"`
+	CdnDataURL       string `xml:"cdndataurl"`
+	ThumbFullMD5     string `xml:"thumbfullmd5"`
+	SrcMsgLocalID    int64  `xml:"srcMsgLocalid"`
+	SrcMsgCreateTime int64  `xml:"srcMsgCreateTime"`
+}
+
+// ForwardItem is a JSON-serializable view of one forwarded sub-message.
+// Only populated fields are emitted (omitempty) so text items don't carry
+// file-specific keys.
+type ForwardItem struct {
+	DataType         int    `json:"datatype"`
+	SourceName       string `json:"sourcename,omitempty"`
+	SourceTime       string `json:"sourcetime,omitempty"`
+	DataTitle        string `json:"datatitle,omitempty"`
+	DataDesc         string `json:"datadesc,omitempty"`
+	DataFmt          string `json:"datafmt,omitempty"`
+	FullMD5          string `json:"fullmd5,omitempty"`
+	DataSize         int64  `json:"datasize,omitempty"`
+	SrcMsgLocalID    int64  `json:"src_msg_localid,omitempty"`
+	SrcMsgCreateTime int64  `json:"src_msg_create_time,omitempty"`
+}
+
+// ForwardItems extracts structured sub-messages from a forward_chat (subtype=19)
+// XML. Returns nil on parse failure or when the message is not a forward.
+// Binary/media payloads (cdndataurl / aeskey) are intentionally dropped — they
+// are encrypted CDN pointers unusable without the WeChat client.
+func ForwardItems(content string) []ForwardItem {
+	var m xmlForwardMsg
+	if err := xml.Unmarshal([]byte(StripMsgPrefix(content)), &m); err != nil {
+		return nil
+	}
+	inner := strings.TrimSpace(m.AppMsg.RecordItem)
+	if inner == "" {
+		return nil
+	}
+	var ri xmlForwardRecordInfo
+	if err := xml.Unmarshal([]byte(inner), &ri); err != nil {
+		return nil
+	}
+	if len(ri.DataItems) == 0 {
+		return nil
+	}
+	out := make([]ForwardItem, 0, len(ri.DataItems))
+	for _, it := range ri.DataItems {
+		out = append(out, ForwardItem{
+			DataType:         it.DataType,
+			SourceName:       it.SourceName,
+			SourceTime:       it.SourceTime,
+			DataTitle:        it.DataTitle,
+			DataDesc:         it.DataDesc,
+			DataFmt:          it.DataFmt,
+			FullMD5:          it.FullMD5,
+			DataSize:         it.DataSize,
+			SrcMsgLocalID:    it.SrcMsgLocalID,
+			SrcMsgCreateTime: it.SrcMsgCreateTime,
+		})
+	}
+	return out
+}

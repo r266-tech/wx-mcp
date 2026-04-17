@@ -117,3 +117,59 @@ func TestFavoriteInfo_Malformed(t *testing.T) {
 		t.Errorf("malformed should return empty, got (%q,%q,%q)", title, desc, url)
 	}
 }
+
+const forwardSample = `<msg><appmsg appid="" sdkver="0"><title>群聊的聊天记录</title><des>V: [文件] wx-mcp.zip
+V: 谁在用cc</des><type>19</type><recorditem><![CDATA[<recordinfo><fromscene>0</fromscene><favcreatetime>1776405641</favcreatetime><title>群聊的聊天记录</title><desc>V: [文件] wx-mcp.zip</desc><datalist count="3"><dataitem datatype="8" dataid="aaa"><datafmt>zip</datafmt><sourcename>V</sourcename><sourcetime>2026-04-17 13:59</sourcetime><datatitle>wx-mcp.zip</datatitle><fullmd5>d205fc3df103b57f137242314a05edef</fullmd5><datasize>4385180</datasize><srcMsgLocalid>5928</srcMsgLocalid><srcMsgCreateTime>1776405582</srcMsgCreateTime></dataitem><dataitem datatype="1" dataid="bbb"><sourcename>V</sourcename><sourcetime>2026-04-17 13:59</sourcetime><datadesc>谁在用cc, 可以试用下这个mcp</datadesc><srcMsgLocalid>5929</srcMsgLocalid><srcMsgCreateTime>1776405582</srcMsgCreateTime></dataitem><dataitem datatype="1" dataid="ccc"><sourcename>V</sourcename><sourcetime>2026-04-17 14:00</sourcetime><datadesc>初始化, 第一次用的时候会慢</datadesc><srcMsgLocalid>5931</srcMsgLocalid><srcMsgCreateTime>1776405624</srcMsgCreateTime></dataitem></datalist></recordinfo>]]></recorditem></appmsg></msg>`
+
+func TestForwardItems(t *testing.T) {
+	items := ForwardItems(forwardSample)
+	if len(items) != 3 {
+		t.Fatalf("expected 3 items, got %d", len(items))
+	}
+
+	// File item
+	if items[0].DataType != 8 {
+		t.Errorf("items[0].DataType = %d, want 8", items[0].DataType)
+	}
+	if items[0].DataTitle != "wx-mcp.zip" {
+		t.Errorf("items[0].DataTitle = %q", items[0].DataTitle)
+	}
+	if items[0].DataFmt != "zip" {
+		t.Errorf("items[0].DataFmt = %q", items[0].DataFmt)
+	}
+	if items[0].FullMD5 != "d205fc3df103b57f137242314a05edef" {
+		t.Errorf("items[0].FullMD5 = %q", items[0].FullMD5)
+	}
+	if items[0].DataSize != 4385180 {
+		t.Errorf("items[0].DataSize = %d", items[0].DataSize)
+	}
+	if items[0].SrcMsgLocalID != 5928 {
+		t.Errorf("items[0].SrcMsgLocalID = %d", items[0].SrcMsgLocalID)
+	}
+
+	// Text items
+	if items[1].DataType != 1 || items[1].DataDesc != "谁在用cc, 可以试用下这个mcp" {
+		t.Errorf("items[1] = %+v", items[1])
+	}
+	if items[2].DataType != 1 || items[2].DataDesc != "初始化, 第一次用的时候会慢" {
+		t.Errorf("items[2] = %+v", items[2])
+	}
+
+	// Common fields
+	if items[0].SourceName != "V" {
+		t.Errorf("items[0].SourceName = %q", items[0].SourceName)
+	}
+	if items[2].SourceTime != "2026-04-17 14:00" {
+		t.Errorf("items[2].SourceTime = %q", items[2].SourceTime)
+	}
+}
+
+func TestForwardItems_Malformed(t *testing.T) {
+	if items := ForwardItems("not xml"); items != nil {
+		t.Errorf("malformed should return nil, got %+v", items)
+	}
+	// Non-forward app msg should return nil
+	if items := ForwardItems(transferSample); items != nil {
+		t.Errorf("non-forward should return nil, got %+v", items)
+	}
+}
