@@ -127,7 +127,11 @@ type xmlForwardRecordInfo struct {
 	DataItems []xmlForwardItem `xml:"datalist>dataitem"`
 }
 
-// xmlForwardItem is one dataitem within a recordinfo datalist.
+// xmlForwardItem is one dataitem within a recordinfo datalist. RawInner
+// captures the entire element content so nested forward payloads (datatype=17)
+// can be re-scanned for an inner <recordinfo> without committing to a specific
+// wrapper tag (wechat versions differ: sometimes <recordxml>, sometimes inline
+// CDATA, sometimes raw nested <recordinfo>).
 type xmlForwardItem struct {
 	DataType         int    `xml:"datatype,attr"`
 	DataID           string `xml:"dataid,attr"`
@@ -138,34 +142,35 @@ type xmlForwardItem struct {
 	DataFmt          string `xml:"datafmt"`
 	FullMD5          string `xml:"fullmd5"`
 	DataSize         int64  `xml:"datasize"`
-	CdnThumbURL      string `xml:"cdnthumburl"`
-	CdnDataURL       string `xml:"cdndataurl"`
-	ThumbFullMD5     string `xml:"thumbfullmd5"`
 	SrcMsgLocalID    int64  `xml:"srcMsgLocalid"`
 	SrcMsgCreateTime int64  `xml:"srcMsgCreateTime"`
+	RawInner         string `xml:",innerxml"`
 }
 
 // ForwardItem is a JSON-serializable view of one forwarded sub-message.
 // Only populated fields are emitted (omitempty) so text items don't carry
-// file-specific keys.
+// file-specific keys. NestedItems is set for datatype=17 (合并转发 nested).
 type ForwardItem struct {
-	DataType         int    `json:"datatype"`
-	SourceName       string `json:"sourcename,omitempty"`
-	SourceTime       string `json:"sourcetime,omitempty"`
-	DataTitle        string `json:"datatitle,omitempty"`
-	DataDesc         string `json:"datadesc,omitempty"`
-	DataFmt          string `json:"datafmt,omitempty"`
-	FullMD5          string `json:"fullmd5,omitempty"`
-	DataSize         int64  `json:"datasize,omitempty"`
-	SrcMsgLocalID    int64  `json:"src_msg_localid,omitempty"`
-	SrcMsgCreateTime int64  `json:"src_msg_create_time,omitempty"`
+	DataType         int           `json:"datatype"`
+	SourceName       string        `json:"sourcename,omitempty"`
+	SourceTime       string        `json:"sourcetime,omitempty"`
+	DataTitle        string        `json:"datatitle,omitempty"`
+	DataDesc         string        `json:"datadesc,omitempty"`
+	DataFmt          string        `json:"datafmt,omitempty"`
+	FullMD5          string        `json:"fullmd5,omitempty"`
+	DataSize         int64         `json:"datasize,omitempty"`
+	SrcMsgLocalID    int64         `json:"src_msg_localid,omitempty"`
+	SrcMsgCreateTime int64         `json:"src_msg_create_time,omitempty"`
+	NestedItems      []ForwardItem `json:"nested_items,omitempty"`
 }
 
 // ForwardItems extracts structured sub-messages from a forward_chat (subtype=19)
-// XML. Returns nil on parse failure or when the message is not a forward.
-// Binary/media payloads (cdndataurl / aeskey) are intentionally dropped — they
-// are encrypted CDN pointers unusable without the WeChat client.
-func ForwardItems(content string) []ForwardItem {
+// XML. depth bounds nested-forward recursion (pass ≥1 to include nested; 0
+// keeps datatype=17 items but without NestedItems). Returns nil on parse
+// failure or when the message is not a forward. Binary/media payloads
+// (cdndataurl / aeskey) are intentionally dropped — encrypted CDN pointers
+// unusable without the WeChat client.
+func ForwardItems(content string, depth int) []ForwardItem {
 	var m xmlForwardMsg
 	if err := xml.Unmarshal([]byte(StripMsgPrefix(content)), &m); err != nil {
 		return nil
@@ -174,8 +179,14 @@ func ForwardItems(content string) []ForwardItem {
 	if inner == "" {
 		return nil
 	}
+	return parseRecordInfo(inner, depth)
+}
+
+// parseRecordInfo unmarshals a <recordinfo> XML document into a flat slice of
+// ForwardItem, recursing into nested forwards (datatype=17) up to depth.
+func parseRecordInfo(recordXML string, depth int) []ForwardItem {
 	var ri xmlForwardRecordInfo
-	if err := xml.Unmarshal([]byte(inner), &ri); err != nil {
+	if err := xml.Unmarshal([]byte(recordXML), &ri); err != nil {
 		return nil
 	}
 	if len(ri.DataItems) == 0 {
@@ -183,7 +194,7 @@ func ForwardItems(content string) []ForwardItem {
 	}
 	out := make([]ForwardItem, 0, len(ri.DataItems))
 	for _, it := range ri.DataItems {
-		out = append(out, ForwardItem{
+		fi := ForwardItem{
 			DataType:         it.DataType,
 			SourceName:       it.SourceName,
 			SourceTime:       it.SourceTime,
@@ -194,7 +205,28 @@ func ForwardItems(content string) []ForwardItem {
 			DataSize:         it.DataSize,
 			SrcMsgLocalID:    it.SrcMsgLocalID,
 			SrcMsgCreateTime: it.SrcMsgCreateTime,
-		})
+		}
+		if it.DataType == 17 && depth > 0 {
+			if nested := extractNestedRecordInfo(it.RawInner); nested != "" {
+				fi.NestedItems = parseRecordInfo(nested, depth-1)
+			}
+		}
+		out = append(out, fi)
 	}
 	return out
+}
+
+// extractNestedRecordInfo scans a dataitem's inner XML for the first
+// <recordinfo>...</recordinfo> block, regardless of wrapping tag or CDATA.
+// Returns the extracted block or empty string if none found.
+func extractNestedRecordInfo(inner string) string {
+	start := strings.Index(inner, "<recordinfo>")
+	if start < 0 {
+		return ""
+	}
+	end := strings.Index(inner[start:], "</recordinfo>")
+	if end < 0 {
+		return ""
+	}
+	return inner[start : start+end+len("</recordinfo>")]
 }

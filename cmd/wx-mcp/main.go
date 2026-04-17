@@ -320,7 +320,7 @@ var toolDefs = []toolDef{
 			"fields=full 额外返回: subtype / message_content (raw 文本/XML) / " +
 			"message_content_parsed (图/表情/app XML 结构化, 引用递归 depth=3). " +
 			"forward_chat (subtype=19) 的 parsed 额外含 forward_items[] (每条: datatype/sourcename/sourcetime/datatitle/datadesc/datafmt/fullmd5/datasize/src_msg_localid); " +
-			"datatype 1=text/2=image/3=voice/4=video/5=link/8=file/17=nested-forward (文本走 datadesc, 文件走 datatitle+fullmd5). " +
+			"datatype 1=text/2=image/3=voice/4=video/5=link/8=file/17=nested-forward (文本走 datadesc, 文件走 datatitle+fullmd5; 嵌套走 nested_items[] 递归 depth=3). " +
 			"base_kind: 1=text/3=image/34=voice/42=card/43=video/47=sticker/48=location/49=app/50=voip/10000=system. " +
 			"kind_name 在 base_kind=49 时按 subtype 细化: 5=link/6=file/19=forward_chat/33,36=miniprogram/" +
 			"57=quote/87=announcement/2000=transfer/2001=red_packet/62=pat/51=channel_video/3=music. " +
@@ -1867,7 +1867,7 @@ func parseMessageContent(baseKind, subtype int32, raw string, depth int) any {
 			"url":         m.AppMsg.URL,
 		}
 		if subtype == 19 {
-			if items := wxparse.ForwardItems(raw); len(items) > 0 {
+			if items := wxparse.ForwardItems(raw, depth); len(items) > 0 {
 				out["forward_items"] = items
 			}
 		}
