@@ -3,6 +3,7 @@ package wcdb
 import (
 	"encoding/hex"
 	"fmt"
+	"os"
 	"sync"
 	"unsafe"
 
@@ -89,6 +90,11 @@ type DB struct {
 	path   string
 }
 
+// Open opens a WCDB-encrypted SQLite file with the legacy "master password"
+// path: hexKey is the 64-hex 32-byte password originally fetched from
+// WeFlow's safeStorage. SQLCipher runs PBKDF2-HMAC-SHA512 (256000 rounds) on
+// every open to derive the per-DB enc_key — slow but compatible with old
+// configs that lack a per-salt key map.
 func Open(dbPath string, hexKey string) (*DB, error) {
 	keyBytes, err := hex.DecodeString(hexKey)
 	if err != nil {
@@ -97,18 +103,75 @@ func Open(dbPath string, hexKey string) (*DB, error) {
 	if len(keyBytes) == 0 {
 		return nil, fmt.Errorf("empty key")
 	}
+	return openWithKeyBlob(dbPath, keyBytes)
+}
 
+// OpenWithEncKey opens a WCDB-encrypted SQLite file using the raw-key path:
+// encKeyHex is the 64-hex post-PBKDF2 enc_key (as harvested by `wxkey scan`)
+// and saltHex is the 32-hex SQLCipher salt taken from the file's first 16
+// bytes. Skips PBKDF2 entirely; opening cost drops to a couple of HMACs.
+func OpenWithEncKey(dbPath, encKeyHex, saltHex string) (*DB, error) {
+	if len(encKeyHex) != 64 {
+		return nil, fmt.Errorf("OpenWithEncKey: enc_key must be 64 hex (got %d)", len(encKeyHex))
+	}
+	if len(saltHex) != 32 {
+		return nil, fmt.Errorf("OpenWithEncKey: salt must be 32 hex (got %d)", len(saltHex))
+	}
+	// Build "x'<64hex><32hex>'" — SQLCipher's raw-key SQL literal form.
+	blob := []byte("x'" + encKeyHex + saltHex + "'")
+	return openWithKeyBlob(dbPath, blob)
+}
+
+// OpenWithKeyMap opens dbPath after reading the SQLCipher salt from the file
+// header (first 16 bytes) and looking up the matching enc_key in keys
+// (salt-hex → enc_key-hex). If the salt isn't in the map and fallbackHexKey
+// is non-empty, falls back to the schema-1 master-password path (slow:
+// triggers WCDB's internal 256000-round PBKDF2 on each open). This handles
+// message-shard DBs whose enc_keys never landed in WeChat's heap because
+// WeChat hasn't touched that shard this session.
+//
+// fallbackHexKey may be the empty string to disable the fallback.
+func OpenWithKeyMap(dbPath string, keys map[string]string, fallbackHexKey string) (*DB, error) {
+	salt, err := readDBSalt(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	saltHex := hex.EncodeToString(salt)
+	if encKeyHex, ok := keys[saltHex]; ok {
+		return OpenWithEncKey(dbPath, encKeyHex, saltHex)
+	}
+	if fallbackHexKey == "" {
+		return nil, fmt.Errorf("no enc_key for salt %s in %s and no fallback master password — re-run `wxkey setup` after touching this DB in WeChat", saltHex, dbPath)
+	}
+	return Open(dbPath, fallbackHexKey)
+}
+
+func openWithKeyBlob(dbPath string, blob []byte) (*DB, error) {
 	var h uintptr
 	if rc := sqlite3_open_v2(dbPath, &h, SQLITE_OPEN_READONLY, nil); rc != SQLITE_OK {
 		return nil, fmt.Errorf("sqlite3_open_v2(%s) rc=%d: %s", dbPath, rc, errmsg(h))
 	}
-
-	if rc := sqlite3_key_v2(h, "main", unsafe.Pointer(&keyBytes[0]), int32(len(keyBytes))); rc != SQLITE_OK {
+	if rc := sqlite3_key_v2(h, "main", unsafe.Pointer(&blob[0]), int32(len(blob))); rc != SQLITE_OK {
 		sqlite3_close_v2(h)
 		return nil, fmt.Errorf("sqlite3_key_v2 rc=%d", rc)
 	}
-
 	return &DB{handle: h, path: dbPath}, nil
+}
+
+// readDBSalt reads the first 16 bytes of dbPath — these are the SQLCipher
+// salt and uniquely identify which enc_key opens the file.
+func readDBSalt(dbPath string) ([]byte, error) {
+	f, err := os.Open(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", dbPath, err)
+	}
+	defer f.Close()
+	salt := make([]byte, 16)
+	n, err := f.Read(salt)
+	if err != nil || n != 16 {
+		return nil, fmt.Errorf("read salt %s: %w (n=%d)", dbPath, err, n)
+	}
+	return salt, nil
 }
 
 func (d *DB) Close() {

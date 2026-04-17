@@ -8,12 +8,36 @@ import (
 	"path/filepath"
 )
 
+// Config is wx-mcp's persistent state (~/.config/wxcli/config.json).
+//
+// Schema 2 (current, written by `wxkey setup`) carries a per-DB enc_key map:
+// each WCDB file's SQLCipher salt → its 32-byte post-PBKDF2 encryption key.
+// wcdb.Open formats that pair as the SQL literal `x'<key><salt>'` to skip
+// the 256000-round key derivation on every open.
+//
+// Schema 1 (legacy, written by the old WeFlow-injected setup) carries the
+// 32-byte master password in Key. Still honored on read so an old config
+// keeps working until the user re-runs setup.
 type Config struct {
-	Wxid     string `json:"wxid"`
-	Key      string `json:"key"`
-	DBRoot   string `json:"db_root"`
-	KeyPID   int    `json:"key_pid,omitempty"`
-	KeyEpoch int64  `json:"key_epoch,omitempty"`
+	SchemaVersion int               `json:"schema_version,omitempty"`
+	Wxid          string            `json:"wxid"`
+	DBRoot        string            `json:"db_root"`
+	Keys          map[string]string `json:"keys,omitempty"` // salt-hex → enc_key-hex (schema 2)
+	Key           string            `json:"key,omitempty"`  // master password (schema 1, legacy)
+	KeyPID        int               `json:"key_pid,omitempty"`
+	KeyEpoch      int64             `json:"key_epoch,omitempty"`
+}
+
+// Ready reports whether the config has enough material to open WCDB files —
+// either a populated schema-2 keys map or a legacy master password.
+func (c *Config) Ready() bool {
+	if c == nil {
+		return false
+	}
+	if len(c.Keys) > 0 {
+		return true
+	}
+	return c.Key != ""
 }
 
 func dir() (string, error) {

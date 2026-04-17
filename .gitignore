@@ -1,4 +1,5 @@
 /wx-mcp
 /dist/
+/lib/*.dylib
 *.log
 .DS_Store

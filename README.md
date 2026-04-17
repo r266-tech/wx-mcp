@@ -117,6 +117,13 @@ wx-mcp-v1.3.0-darwin-arm64/
 
 ## Changelog
 
+### v1.3.1 (2026-04-16)
+- **messages** 支持公众号/服务号 — `findMsgDB` 以前只扫 `message_0..4.db`, 漏了 `biz_message_0..1.db` (公众号消息实际存那边), 导致所有 `gh_*` 拉不到消息. 现在 glob 扫 `(message|biz_message)_<n>.db` 全族, shard 数也不再 hardcode
+- **favorites** 剥 raw `type_id` (= raw int 重复 `favorite_type`) — 违反"raw int 全 resolve"原则
+- **sessions.last_sender_wxid** 剥订阅号合集 sender 前缀 — 以前返回 `_$_CUSTOM_USERNAME_PREFIX_$_<aggId>:<realId>`, 现在只保留 `<realId>` (通常是 `gh_xxx`)
+- **messages** 对聚合 session (`brandsessionholder` / `brandservicesessionholder`) 给明确错误 "本身无消息表, 按具体 gh_<id> 查", 替换 cryptic "table not found"
+- **schema** 按 prefix 分族列 db — 以前把 `biz_message_*` / `message_fts` 误折成 `message_0..4` 的 shard, 现在 `message`/`biz_message`/`message_fts`/`message_resource` 各占一条, `shard_count` 按族算
+
 ### v1.3.0 (2026-04-16)
 - **messages.keyword** 修 zstd bug — 原本 SQL LIKE 在压缩字节上 match 失败, 现在拉宽 SQL 后在解压内容上 in-memory filter, 能命中 app 类消息 (转账/链接/小程序/...)
 - **transfers** 加 amount / description / memo (batch join messages 解 XML); 字段 rename: payer_wxid / receiver_wxid / session_username

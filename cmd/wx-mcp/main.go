@@ -19,7 +19,7 @@ import (
 
 	"github.com/r266-tech/wx-mcp/internal/config"
 	"github.com/r266-tech/wx-mcp/internal/wcdb"
-	"github.com/r266-tech/wx-mcp/internal/weflow"
+	"github.com/r266-tech/wx-mcp/internal/wxkey"
 	"github.com/r266-tech/wx-mcp/internal/wxkind"
 	"github.com/r266-tech/wx-mcp/internal/wxparse"
 )
@@ -74,29 +74,34 @@ type server struct {
 	ok       bool
 }
 
-// findWCDB locates libWCDB.dylib. Prefers WeFlow's bundled copy
-// (required anyway for initial key import), falls back to a
-// dylib placed next to the binary.
+// findWCDB locates libWCDB.dylib. Looks in this order:
+//  1. next to the wx-mcp binary (release archive layout: bin/wx-mcp + lib/dylib)
+//  2. ~/.config/wxcli/lib/ (shared install)
+//  3. WeFlow's bundled copy (legacy fallback)
 func findWCDB() (string, error) {
-	candidates := []string{
-		"/Applications/WeFlow.app/Contents/Resources/resources/wcdb/macos/universal/libWCDB.dylib",
-	}
+	var candidates []string
 	if exe, err := os.Executable(); err == nil {
 		if exe, err = filepath.EvalSymlinks(exe); err == nil {
 			dir := filepath.Dir(exe)
 			candidates = append(candidates,
 				filepath.Join(dir, "libWCDB.dylib"),
 				filepath.Join(dir, "lib", "libWCDB.dylib"),
+				filepath.Join(dir, "..", "lib", "libWCDB.dylib"),
 				filepath.Join(dir, "lib", "WCDB.framework", "Versions", "2.1.15", "WCDB"),
 			)
 		}
 	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".config", "wxcli", "lib", "libWCDB.dylib"))
+	}
+	candidates = append(candidates,
+		"/Applications/WeFlow.app/Contents/Resources/resources/wcdb/macos/universal/libWCDB.dylib")
 	for _, p := range candidates {
 		if _, err := os.Stat(p); err == nil {
 			return p, nil
 		}
 	}
-	return "", fmt.Errorf("libWCDB.dylib 未找到 (请确保 WeFlow 已安装)")
+	return "", fmt.Errorf("libWCDB.dylib 未找到。把它放在 wx-mcp 旁边 (./lib/libWCDB.dylib) 或 ~/.config/wxcli/lib/")
 }
 
 func (s *server) ensure() error {
@@ -122,21 +127,20 @@ func (s *server) ensure() error {
 		}
 		_ = config.Save(cfg)
 	}
-	if cfg.Key == "" {
-		if !weflow.Available() {
-			return fmt.Errorf("需要先安装 WeFlow 并连接微信 (https://weflow.cc)")
-		}
-		fmt.Fprintln(os.Stderr, "[wx-mcp]auto-importing key from WeFlow...")
-		imp, err := weflow.ImportKey()
+	if !cfg.Ready() {
+		fmt.Fprintln(os.Stderr, "[wx-mcp] no DB key cached — running `wxkey setup` (admin prompt may appear)...")
+		res, stderr, err := wxkey.RunSetup()
 		if err != nil {
-			return fmt.Errorf("WeFlow 密钥导入失败: %w", err)
+			return fmt.Errorf("wxkey setup failed: %w\n%s", err, stderr)
 		}
-		cfg.Key = imp.HexKey
-		cfg.Wxid = imp.Wxid
-		cfg.DBRoot = imp.DBRoot
-		cfg.KeyEpoch = time.Now().Unix()
-		_ = config.Save(cfg)
-		fmt.Fprintln(os.Stderr, "[wx-mcp]key imported OK")
+		// wxkey writes the config itself; reload to pick up the new keys map.
+		fresh, err := config.Load()
+		if err != nil {
+			return fmt.Errorf("reload config after wxkey setup: %w", err)
+		}
+		cfg = fresh
+		fmt.Fprintf(os.Stderr, "[wx-mcp] wxkey setup OK — %d per-DB keys cached for wxid=%s\n",
+			len(res.Keys), res.WxID)
 	}
 	s.cfg = cfg
 	s.wcdbPath = wcdbPath
@@ -151,12 +155,39 @@ func (s *server) openDB(subdir, file string) (*wcdb.DB, error) {
 	if err := wcdb.Bootstrap(s.wcdbPath); err != nil {
 		return nil, err
 	}
-	return wcdb.Open(filepath.Join(s.cfg.DBRoot, "db_storage", subdir, file), s.cfg.Key)
+	dbPath := filepath.Join(s.cfg.DBRoot, "db_storage", subdir, file)
+	if len(s.cfg.Keys) > 0 {
+		// Prefer schema-2 enc_key per salt; fall back to legacy master password
+		// for DBs whose key didn't land in WeChat's heap during the scan.
+		return wcdb.OpenWithKeyMap(dbPath, s.cfg.Keys, s.cfg.Key)
+	}
+	// Pure schema-1 (legacy) — slow PBKDF2 on every open.
+	return wcdb.Open(dbPath, s.cfg.Key)
 }
 
+// msgShardRE matches message / biz_message shard filenames.
+// message_<n>.db holds regular (friend/group) chat; biz_message_<n>.db holds
+// official-account (gh_ / brandsessionholder) chat. Shard count is dynamic —
+// WCDB grows new files as data scales — so glob instead of hardcoding 0..4.
+var msgShardRE = regexp.MustCompile(`^(message|biz_message)_\d+\.db$`)
+
 func (s *server) findMsgDB(tableName string) (*wcdb.DB, error) {
-	for i := 0; i < 5; i++ {
-		db, err := s.openDB("message", fmt.Sprintf("message_%d.db", i))
+	if err := s.ensure(); err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(s.cfg.DBRoot, "db_storage", "message")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read message dir: %w", err)
+	}
+	var shards []string
+	for _, e := range entries {
+		if !e.IsDir() && msgShardRE.MatchString(e.Name()) {
+			shards = append(shards, e.Name())
+		}
+	}
+	for _, name := range shards {
+		db, err := s.openDB("message", name)
 		if err != nil {
 			continue
 		}
@@ -166,7 +197,7 @@ func (s *server) findMsgDB(tableName string) (*wcdb.DB, error) {
 		}
 		db.Close()
 	}
-	return nil, fmt.Errorf("table %s not found in message_0..4.db", tableName)
+	return nil, fmt.Errorf("table %s not found in %d message shards", tableName, len(shards))
 }
 
 // ──────────────────── main loop ────────────────────
@@ -200,7 +231,7 @@ func (s *server) handle(req rpcRequest) rpcResponse {
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
 			"protocolVersion": "2024-11-05",
 			"capabilities":   map[string]any{"tools": map[string]any{}},
-			"serverInfo":     map[string]any{"name": "wx-mcp", "version": "1.3.0"},
+			"serverInfo":     map[string]any{"name": "wx-mcp", "version": "1.3.1"},
 		}}
 	case "tools/list":
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"tools": toolDefs}}
@@ -382,7 +413,7 @@ var toolDefs = []toolDef{
 	{
 		Name: "favorites",
 		Description: "微信收藏. 字段: server_id / favorite_type (text/image/voice/video/link/location/file/" +
-			"chat_history/miniprogram/unknown) / type_id (raw int) / update_time / source_id (内部复合 ID) / " +
+			"chat_history/miniprogram/unknown) / update_time / source_id (内部复合 ID) / " +
 			"from_wxid / from_display_name / source_chat_username (omitempty) / source_chat_display_name / " +
 			"content (XML 原文) / title (从 XML 提取, omitempty) / description (omitempty) / url (omitempty). " +
 			"after/before 按 update_time 过滤, 接 unix秒 或 2006-01-02 (本地时区).",
@@ -488,6 +519,12 @@ func (s *server) toolSessions(a map[string]any) (any, error) {
 		bk, _ := r["last_msg_type"].(int64)
 		st, _ := r["last_msg_sub_type"].(int64)
 		r["last_msg_kind_name"] = wxkind.Resolve(int32(bk), int32(st))
+		// Aggregator sessions (brandsessionholder / brandservicesessionholder)
+		// wrap the real sender in "_$_CUSTOM_USERNAME_PREFIX_$_<aggId>:<realId>".
+		// The aggId is UI-internal noise; keep only the real wxid / gh_ id.
+		if v, ok := r["last_sender_wxid"].(string); ok {
+			r["last_sender_wxid"] = stripAggSenderPrefix(v)
+		}
 		for _, k := range []string{"last_sender_wxid", "last_sender_display_name"} {
 			if v, ok := r[k].(string); ok && v == "" {
 				delete(r, k)
@@ -495,6 +532,27 @@ func (s *server) toolSessions(a map[string]any) (any, error) {
 		}
 	}
 	return rows, nil
+}
+
+const aggSenderPrefix = "_$_CUSTOM_USERNAME_PREFIX_$_"
+
+// aggregatorSessions are WeChat UI "folder" sessions that bundle other sessions.
+// They have no Msg_<hash> table of their own — the real messages live under
+// the contained account's own wxid (e.g. each gh_* public account).
+var aggregatorSessions = map[string]bool{
+	"brandsessionholder":        true, // 订阅号合集
+	"brandservicesessionholder": true, // 服务号合集
+}
+
+func stripAggSenderPrefix(s string) string {
+	if !strings.HasPrefix(s, aggSenderPrefix) {
+		return s
+	}
+	rest := s[len(aggSenderPrefix):]
+	if i := strings.IndexByte(rest, ':'); i >= 0 {
+		return rest[i+1:]
+	}
+	return rest
 }
 
 func (s *server) toolContacts(a map[string]any) (any, error) {
@@ -558,6 +616,9 @@ func (s *server) toolMessages(a map[string]any) (any, error) {
 	talker := getStr(a, "talker")
 	if talker == "" {
 		return nil, fmt.Errorf("talker is required")
+	}
+	if aggregatorSessions[talker] {
+		return nil, fmt.Errorf("%q 是订阅号合集入口 (UI 聚合 session), 本身无消息表. 真实消息在各 gh_* 公众号下, 按具体 gh_<id> 查", talker)
 	}
 	tableName := "Msg_" + talkerHash(talker)
 	db, err := s.findMsgDB(tableName)
@@ -1128,6 +1189,7 @@ func (s *server) toolFavorites(a map[string]any) (any, error) {
 	for _, r := range rows {
 		ti, _ := r["type_id"].(int64)
 		r["favorite_type"] = wxkind.FavKind(ti)
+		delete(r, "type_id")
 		if c, ok := r["content"].(string); ok && c != "" {
 			if title, desc, url := wxparse.FavoriteInfo(c); title != "" || desc != "" || url != "" {
 				if title != "" {
@@ -1223,7 +1285,12 @@ func (s *server) toolSchema(a map[string]any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	shardRE := regexp.MustCompile(`_\d+\.db$`)
+	// Shard filenames look like <prefix>_<n>.db where <prefix> may itself
+	// contain underscores (e.g. biz_message_0.db → prefix=biz_message).
+	// Group by prefix so different shard families (message vs biz_message)
+	// don't collapse into each other, and non-shard dbs (message_fts.db,
+	// message_resource.db) stay separate.
+	shardRE := regexp.MustCompile(`^(.+)_\d+\.db$`)
 	type out struct {
 		Subdir     string   `json:"subdir"`
 		File       string   `json:"file"`
@@ -1242,45 +1309,60 @@ func (s *server) toolSchema(a map[string]any) (any, error) {
 			result = append(result, out{Subdir: sub, Error: err.Error()})
 			continue
 		}
-		var canonical string
-		shardCount := 0
+		// Group shard families by prefix; keep non-shard dbs as individuals.
+		type family struct {
+			canonical string
+			count     int
+		}
+		families := map[string]*family{}
+		var singles []string
 		for _, f := range files {
 			name := f.Name()
 			if !strings.HasSuffix(name, ".db") {
 				continue
 			}
-			if shardRE.MatchString(name) {
-				shardCount++
-				if canonical == "" {
-					canonical = name
+			if mm := shardRE.FindStringSubmatch(name); mm != nil {
+				prefix := mm[1]
+				fam := families[prefix]
+				if fam == nil {
+					fam = &family{canonical: name}
+					families[prefix] = fam
+				} else if name < fam.canonical {
+					fam.canonical = name
 				}
-			} else if canonical == "" || shardRE.MatchString(canonical) {
-				canonical = name
+				fam.count++
+			} else {
+				singles = append(singles, name)
 			}
 		}
-		if canonical == "" {
-			continue
-		}
-		db, err := s.openDB(sub, canonical)
-		if err != nil {
-			result = append(result, out{Subdir: sub, File: canonical, ShardCount: shardCount, Error: err.Error()})
-			continue
-		}
-		rows, err := db.Query(`SELECT name FROM sqlite_master
-			WHERE type='table' AND name NOT LIKE 'sqlite_%'
-			ORDER BY name`)
-		db.Close()
-		if err != nil {
-			result = append(result, out{Subdir: sub, File: canonical, ShardCount: shardCount, Error: err.Error()})
-			continue
-		}
-		tables := make([]string, 0, len(rows))
-		for _, r := range rows {
-			if n, ok := r["name"].(string); ok {
-				tables = append(tables, n)
+		listFile := func(name string, shardCount int) {
+			db, err := s.openDB(sub, name)
+			if err != nil {
+				result = append(result, out{Subdir: sub, File: name, ShardCount: shardCount, Error: err.Error()})
+				return
 			}
+			rows, err := db.Query(`SELECT name FROM sqlite_master
+				WHERE type='table' AND name NOT LIKE 'sqlite_%'
+				ORDER BY name`)
+			db.Close()
+			if err != nil {
+				result = append(result, out{Subdir: sub, File: name, ShardCount: shardCount, Error: err.Error()})
+				return
+			}
+			tables := make([]string, 0, len(rows))
+			for _, r := range rows {
+				if n, ok := r["name"].(string); ok {
+					tables = append(tables, n)
+				}
+			}
+			result = append(result, out{Subdir: sub, File: name, ShardCount: shardCount, Tables: tables})
 		}
-		result = append(result, out{Subdir: sub, File: canonical, ShardCount: shardCount, Tables: tables})
+		for _, fam := range families {
+			listFile(fam.canonical, fam.count)
+		}
+		for _, name := range singles {
+			listFile(name, 0)
+		}
 	}
 	return result, nil
 }
