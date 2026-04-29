@@ -1,5 +1,5 @@
 // Package wxkind maps wechat raw integer codes to human-readable labels.
-// Sources: WeFlow electron services + observed WeChat 4.x schema.
+// Sources: observed WeChat 4.x schema + reverse-engineered electron services.
 package wxkind
 
 import "strings"

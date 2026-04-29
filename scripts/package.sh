@@ -8,9 +8,9 @@ VERSION="${1:-1.0.0}"
 SRCDIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$SRCDIR"
 
-DYLIB_SRC=/Applications/WeFlow.app/Contents/Resources/resources/wcdb/macos/universal/libWCDB.dylib
+DYLIB_SRC="$SRCDIR/lib/libWCDB.dylib"
 if [[ ! -f "$DYLIB_SRC" ]]; then
-  echo "ERROR: $DYLIB_SRC not found — WeFlow not installed on this build host" >&2
+  echo "ERROR: $DYLIB_SRC missing — repo lib/ should ship libWCDB.dylib" >&2
   exit 1
 fi
 

@@ -1,6 +1,6 @@
 // Standalone test: open every WeChat DB using only the new schema-2 keys map
 // from ~/.config/wxcli/config.json + wx-mcp's wcdb package. Proves the
-// WeFlow-free path actually works end-to-end.
+// self-contained decrypt path actually works end-to-end.
 package main
 
 import (
@@ -37,8 +37,16 @@ func main() {
 		fail("schema-2 keys map is empty — schema-1 fallback would still work but isn't what we're testing")
 	}
 
-	// libWCDB.dylib path: same resolution as wx-mcp main.go.
-	wcdbPath := "/Applications/WeFlow.app/Contents/Resources/resources/wcdb/macos/universal/libWCDB.dylib"
+	// libWCDB.dylib path: same resolution as wx-mcp main.go (repo-bundled lib/).
+	wcdbPath := "lib/libWCDB.dylib"
+	if home, err := os.UserHomeDir(); err == nil {
+		if _, err := os.Stat(wcdbPath); err != nil {
+			alt := filepath.Join(home, ".config", "wxcli", "lib", "libWCDB.dylib")
+			if _, err2 := os.Stat(alt); err2 == nil {
+				wcdbPath = alt
+			}
+		}
+	}
 	if _, err := os.Stat(wcdbPath); err != nil {
 		fail("libWCDB.dylib not found at %s: %v", wcdbPath, err)
 	}

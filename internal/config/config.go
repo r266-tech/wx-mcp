@@ -15,9 +15,9 @@ import (
 // wcdb.Open formats that pair as the SQL literal `x'<key><salt>'` to skip
 // the 256000-round key derivation on every open.
 //
-// Schema 1 (legacy, written by the old WeFlow-injected setup) carries the
-// 32-byte master password in Key. Still honored on read so an old config
-// keeps working until the user re-runs setup.
+// Schema 1 (legacy v1 setup) carries the 32-byte master password in Key.
+// Still honored on read so an old config keeps working until the user
+// re-runs setup.
 type Config struct {
 	SchemaVersion int               `json:"schema_version,omitempty"`
 	Wxid          string            `json:"wxid"`

@@ -2,9 +2,6 @@
 // (~/cc-workspace/mcp-servers/wxkey/). The CLI handles task_for_pid +
 // memory scan + SQLCipher verification; this package finds the binary,
 // invokes `wxkey setup`, and parses the JSON it prints to stdout.
-//
-// Replaces the older internal/weflow client that talked to WeFlow's V8
-// inspector.
 package wxkey
 
 import (

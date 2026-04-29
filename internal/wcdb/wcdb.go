@@ -91,10 +91,10 @@ type DB struct {
 }
 
 // Open opens a WCDB-encrypted SQLite file with the legacy "master password"
-// path: hexKey is the 64-hex 32-byte password originally fetched from
-// WeFlow's safeStorage. SQLCipher runs PBKDF2-HMAC-SHA512 (256000 rounds) on
-// every open to derive the per-DB enc_key — slow but compatible with old
-// configs that lack a per-salt key map.
+// path: hexKey is the 64-hex 32-byte master password fetched from the WeChat
+// process during the v1 setup flow. SQLCipher runs PBKDF2-HMAC-SHA512 (256000
+// rounds) on every open to derive the per-DB enc_key — slow but compatible
+// with old configs that lack a per-salt key map.
 func Open(dbPath string, hexKey string) (*DB, error) {
 	keyBytes, err := hex.DecodeString(hexKey)
 	if err != nil {

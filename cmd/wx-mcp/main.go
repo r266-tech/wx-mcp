@@ -77,7 +77,6 @@ type server struct {
 // findWCDB locates libWCDB.dylib. Looks in this order:
 //  1. next to the wx-mcp binary (release archive layout: bin/wx-mcp + lib/dylib)
 //  2. ~/.config/wxcli/lib/ (shared install)
-//  3. WeFlow's bundled copy (legacy fallback)
 func findWCDB() (string, error) {
 	var candidates []string
 	if exe, err := os.Executable(); err == nil {
@@ -94,8 +93,6 @@ func findWCDB() (string, error) {
 	if home, err := os.UserHomeDir(); err == nil {
 		candidates = append(candidates, filepath.Join(home, ".config", "wxcli", "lib", "libWCDB.dylib"))
 	}
-	candidates = append(candidates,
-		"/Applications/WeFlow.app/Contents/Resources/resources/wcdb/macos/universal/libWCDB.dylib")
 	for _, p := range candidates {
 		if _, err := os.Stat(p); err == nil {
 			return p, nil
